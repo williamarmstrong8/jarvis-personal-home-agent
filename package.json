@@ -1,0 +1,53 @@
+{
+  "name": "jarvis-ui",
+  "version": "2.0.0",
+  "description": "ULTRON — Holographic UI",
+  "author": "Will Armstrong",
+  "main": "ui/main.js",
+  "scripts": {
+    "start": "electron .",
+    "install:app": "node scripts/install-app.js"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.ultron.jarvis",
+    "productName": "Jarvis",
+    "files": [
+      "ui/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/jarvis-home.txt",
+        "to": "jarvis-home.txt"
+      }
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dir"
+        }
+      ],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "LSUIElement": true,
+        "NSMicrophoneUsageDescription": "Jarvis listens for the wake word and your spoken commands.",
+        "NSAudioCaptureUsageDescription": "Jarvis listens for the wake word and your spoken commands.",
+        "NSAppleEventsUsageDescription": "Jarvis controls other apps when you ask it to.",
+        "NSScreenCaptureDescription": "Jarvis captures the screen only when you ask what's on it."
+      }
+    }
+  }
+}

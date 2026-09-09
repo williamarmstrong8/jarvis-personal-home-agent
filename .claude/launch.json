@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jarvis-ui",
+      "runtimeExecutable": "/usr/bin/python3",
+      "runtimeArgs": ["/tmp/jarvis_serve.py"],
+      "port": 4444
+    }
+  ]
+}

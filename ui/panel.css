@@ -1,0 +1,103 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --red:    #ff2d2d;
+  --green:  #00ff88;
+  --purple: #aa88ff;
+  --amber:  #ff9500;
+  --font:   "Share Tech Mono", "Courier New", monospace;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font);
+  color: #f2f2f2;
+  background: #0a0a0c;
+  user-select: none;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px 12px;
+  gap: 12px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.orb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  flex-shrink: 0;
+}
+
+body.state-listening .orb { background: var(--green);  box-shadow: 0 0 10px var(--green);  animation: pulse 0.8s ease-in-out infinite; }
+body.state-thinking  .orb { background: var(--purple); box-shadow: 0 0 10px var(--purple); animation: pulse 1.4s ease-in-out infinite; }
+body.state-speaking  .orb { background: var(--amber);  box-shadow: 0 0 10px var(--amber);  animation: pulse 0.5s ease-in-out infinite; }
+body.state-offline   .orb { background: #666; box-shadow: none; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.82); }
+}
+
+.brand {
+  font-size: 11px;
+  letter-spacing: 0.28em;
+  color: #ff5a5a;
+}
+
+.status-label {
+  font-size: 13px;
+  color: #eee;
+  margin-top: 1px;
+}
+
+section {
+  min-height: 0;
+}
+
+.label {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: #7a7a82;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.body-text {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #d8d8de;
+  max-height: 4.2em;
+  overflow: hidden;
+}
+
+footer {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid #222;
+}
+
+button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #c44;
+  font-family: inherit;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  padding: 8px 0 2px;
+  cursor: pointer;
+}
+
+button:hover { color: #ff5a5a; }

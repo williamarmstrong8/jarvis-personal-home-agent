@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jarvis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body class="state-idle">
+  <header>
+    <span class="orb" id="orb"></span>
+    <div>
+      <div class="brand">JARVIS</div>
+      <div class="status-label" id="statusLabel">Standby</div>
+    </div>
+  </header>
+
+  <section>
+    <div class="label">Heard</div>
+    <p class="body-text" id="heard">Waiting for “Hey Jarvis”…</p>
+  </section>
+
+  <section>
+    <div class="label">Reply</div>
+    <p class="body-text" id="reply">—</p>
+  </section>
+
+  <section>
+    <div class="label">Tool</div>
+    <p class="body-text" id="tool">—</p>
+  </section>
+
+  <footer>
+    <button type="button" id="quitBtn">Quit Jarvis</button>
+  </footer>
+
+  <script src="panel.js"></script>
+</body>
+</html>

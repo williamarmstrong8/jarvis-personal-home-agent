@@ -1,0 +1,47 @@
+{
+  "location": {
+    "city": "Boston",
+    "latitude": 42.3601,
+    "longitude": -71.0589
+  },
+  "interests": [
+    "artificial intelligence",
+    "startups",
+    "software engineering",
+    "Apple",
+    "basketball",
+    "GTM engineering",
+    "automation",
+    "n8n"
+  ],
+  "news_sources": [
+    {
+      "name": "Hacker News",
+      "url": "https://hnrss.org/frontpage",
+      "category": "tech"
+    },
+    {
+      "name": "TechCrunch",
+      "url": "https://techcrunch.com/feed/",
+      "category": "tech"
+    },
+    {
+      "name": "The Verge",
+      "url": "https://www.theverge.com/rss/index.xml",
+      "category": "tech"
+    },
+    {
+      "name": "Reuters",
+      "url": "https://feeds.reuters.com/reuters/topNews",
+      "category": "world"
+    }
+  ],
+  "podcast": {
+    "host_name": "ARIA",
+    "cohost_name": "JARVIS",
+    "target_duration_minutes": 5,
+    "output_dir": "data/podcasts",
+    "host_voice": "af_sky",
+    "cohost_voice": "am_adam"
+  }
+}

@@ -1,0 +1,588 @@
+"""
+ULTRON — Intent router
+
+Alexa-style pattern matching so obvious commands fire tools immediately.
+Claude still handles personality, ambiguous requests, and multi-step work.
+
+Modes:
+  execute — args are complete; run the tool now, Claude only speaks
+  force   — we know the tool; Claude fills args (tool_choice forced)
+  filter  — we know the domain; send only that family's tools
+  None    — mixed / unclear; full Claude with every tool
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Intent:
+    mode: str                          # execute | force | filter
+    tool: str | None = None
+    inputs: dict | None = None
+    family: str | None = None
+    note: str = ""
+
+
+FAMILY_TOOLS: dict[str, list[str]] = {
+    "spotify":  [
+        "play_spotify", "pause_spotify", "skip_spotify",
+        "resume_spotify", "get_currently_playing",
+    ],
+    "gmail":    ["draft_gmail", "send_gmail", "search_gmail", "read_email"],
+    "notion":   ["create_notion_page", "search_notion", "append_to_notion"],
+    "calendar": ["list_calendar_events", "create_calendar_event"],
+    "search":   ["web_search"],
+    "content":  ["generate_content"],
+    "messages": ["send_imessage", "search_imessage", "airdrop_file"],
+    "podcast":  ["generate_daily_podcast"],
+    "homelab":  [
+        "pi_get_status", "pi_list_movies", "pi_search_movie", "pi_add_movie",
+        "pi_list_releases", "pi_grab_release", "pi_list_series", "pi_search_series",
+        "pi_add_series", "pi_list_episodes", "pi_plex_library", "pi_plex_search",
+        "pi_plex_now_playing", "pi_list_requests", "pi_list_media_files",
+        "pi_docker_restart", "pi_docker_logs", "pi_run_command",
+        "pi_show_card", "pi_clear_card", "pi_now_playing",
+        "play_movie", "open_homelab",
+    ],
+    "screen":   [],   # screenshot is pre-attached; Claude just looks
+}
+
+# Domain keywords — used for mixed-intent detection and filter fallback.
+_FAMILY_KEYWORDS: list[tuple[str, re.Pattern]] = [
+    ("spotify",  re.compile(r"\b(spotify|playlist|album|\bsongs?\b|\btracks?\b|\bmusic\b|now playing)\b")),
+    ("gmail",    re.compile(r"\b(gmail|inbox|emails?|e-?mails?)\b")),
+    ("calendar", re.compile(r"\b(calendar|schedule|meetings?|appointments?)\b")),
+    ("notion",   re.compile(r"\b(notion|note to self)\b")),
+    ("messages", re.compile(r"\b(imessage|i message|airdrop|texts?|sms)\b")),
+    ("content",  re.compile(r"\b(linkedin|tweet|twitter|social post)\b")),
+    ("podcast",  re.compile(r"\b(podcast|daily brief|morning brief)\b")),
+    ("homelab",  re.compile(
+        r"\b(homelab|radarr|sonarr|prowlarr|prowlar|jellyfin|\bplex\b|seerr|"
+        r"overseerr|qbittorrent|qbit|lidarr|bazarr|n8n|home assistant|"
+        r"raspberry pi|the pi|pi lab|pi display|pi monitor|"
+        r"grab (?:a |the )?movie|download (?:a |the )?movie|"
+        r"\bmovies?\b|\bseries\b|\btv shows?\b)\b"
+    )),
+    ("search",   re.compile(r"\b(google|look up|search the web)\b")),
+    ("screen",   re.compile(r"\b(?:on (?:my |the )?(?:screen|display|monitor)|screenshot|look at my screen)\b")),
+]
+
+_WAKE_PREFIX = re.compile(
+    r"^(?:(?:hey|ok|okay|yo)[,.]?\s+)?"
+    r"(?:(?:ultron|jarvis)\s*)+"
+    r"[,.]?\s*",
+    re.I,
+)
+
+_PREFIX = re.compile(
+    r"^(?:(?:hey|ok|okay|yo)[,.]?\s+)?"
+    r"(?:(?:ultron|jarvis)[,.]?\s+)?"
+    r"(?:please\s+)?"
+    r"(?:(?:can|could|would|will)\s+you\s+)?"
+    r"(?:please\s+)?(?:just\s+)?",
+    re.I,
+)
+
+_COMPOUND = re.compile(
+    r"\b(?:and then|after that|and also|, then)\b"
+    r"|\band\s+(?:email|text|message|schedule|search|google|look up|"
+    r"create|draft|send|skip|pause|play)\b",
+    re.I,
+)
+
+# "don't play that" is not a play command. "stop the music" is pause — handled first.
+_NEGATE = re.compile(r"\b(?:don't|do not|never|not going to)\b", re.I)
+
+_NOT_MUSIC = re.compile(
+    r"\b(video|movie|clip|trailer|game|voicemail|recording|podcast|"
+    r"season|episode|s\d{1,2}e\d{1,3}|jellyfin|plex)\b",
+    re.I,
+)
+
+_WATCH_EPISODE = re.compile(
+    r"\b(?:watch|play|put on|stream)\s+"
+    r"(?:season\s+(\w+)\s+episode\s+(\w+)\s+(?:of\s+)?(.+)"
+    r"|(.+?)\s+season\s+(\w+)\s+episode\s+(\w+)"
+    r"|(.+?)\s+s(\d{1,2})\s*e(\d{1,3}))",
+    re.I,
+)
+
+_OPEN_HOMELAB = re.compile(
+    r"^(?:open(?: up)?|launch|bring up|pull up|go to)\s+"
+    r"(?:the |my )?(?:web(?:site| ui) (?:for |of )?)?(.+)$",
+    re.I,
+)
+
+_WATCH_MOVIE = re.compile(
+    r"^(?:watch)\s+(?:the )?(?:movie\s+)?(.+)$"
+    r"|^(?:play|put on)\s+(?:the )?movie\s+(.+)$"
+    r"|^(?:play|put on)\s+(.+?)\s+on\s+(?:jellyfin|plex|(?:the |my )?pi)$",
+    re.I,
+)
+
+_ORDINAL = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+}
+
+_GARBLED_WAKE = re.compile(
+    r"^(?:(?:hey|ok|okay|yo)[,.]?\s+)?"
+    r"\w{2,16}[,.]?\s+"
+    r"(?:please\s+)?(?:can|could|would|will)\s+you\s+",
+    re.I,
+)
+
+_VAGUE_PLAY = re.compile(
+    r"^(?:that|this|it|(?:the |that |this )?(?:song|track|one))$",
+    re.I,
+)
+
+_BARE_MUSIC = re.compile(
+    r"^(?:some )?(?:music|tunes|songs|something|anything)$",
+    re.I,
+)
+
+_CONTEXT_ONLY = re.compile(
+    r"^(?:(?:what(?:'s| is)|how(?:'s| is)) (?:the )?)?"
+    r"(?:weather|temperature|forecast|battery|date|time)"
+    r"(?:\s+today)?$"
+    r"|^(?:what time is it)$",
+    re.I,
+)
+
+_WEATHER_ELSEWHERE = re.compile(
+    r"\b(?:weather|temperature|forecast)\s+in\s+(.+)$",
+    re.I,
+)
+
+_PAUSE = re.compile(
+    r"^(?:pause(?: it| that)?(?: (?:the )?(?:music|song|track|spotify|playback))?|"
+    r"stop (?:the )?(?:music|song|track|playback)|stop playing)$",
+    re.I,
+)
+
+_RESUME = re.compile(
+    r"^(?:resume|unpause|keep playing|continue playing|"
+    r"start playing again|play it again|play)$",
+    re.I,
+)
+
+_SKIP = re.compile(
+    r"^(?:skip(?: (?:this |the )?(?:song|track|one))?|"
+    r"next (?:song|track)|play the next (?:song|track))$",
+    re.I,
+)
+
+_NOW_PLAYING = re.compile(
+    r"^(?:what(?:'s| is) (?:this |the )?(?:song|track|playing)|"
+    r"what (?:song|track) is (?:this|that)|"
+    r"what am i listening to|who(?:'s| is) (?:this|playing|this song)|"
+    r"currently playing|what(?:'s| is) playing)$",
+    re.I,
+)
+
+_PLAY = re.compile(
+    r"^(?:play|put on|queue)\s+"
+    r"(?:me\s+)?(?:some\s+|a\s+|the\s+)?"
+    r"(?:song\s+|track\s+|artist\s+|playlist\s+|album\s+)?"
+    r"(?:called\s+|named\s+)?"
+    r"(.+)$",
+    re.I,
+)
+
+_PODCAST = re.compile(
+    r"\b(?:(?:make|create|generate|start|play) (?:my |the |a )?(?:daily )?(?:podcast|brief)|"
+    r"(?:daily|morning) (?:podcast|brief)|brief me|"
+    r"my (?:daily )?(?:podcast|brief))\b",
+    re.I,
+)
+
+_PI_STATUS = re.compile(
+    r"^(?:how(?:'s| is) (?:the )?(?:pi|raspberry(?: pi)?|homelab)(?: doing)?|"
+    r"(?:check|status(?: of)?) (?:the )?(?:pi|homelab)|"
+    r"homelab status|"
+    r"is (?:the )?(?:pi|homelab) (?:up|ok|okay|online))$",
+    re.I,
+)
+
+_PI_MOVIES = re.compile(
+    r"\b(?:what movies|which movies|my movies|movie library|"
+    r"movies (?:do i have|have i got|on (?:the |my )?(?:pi|plex|jellyfin|radarr|homelab|raspberry))|"
+    r"what(?:'s| is) (?:in )?(?:my )?(?:movie )?library|"
+    r"list (?:my )?movies|show (?:me )?(?:my )?movies)\b",
+    re.I,
+)
+
+_PI_SHOWS = re.compile(
+    r"\b(?:what (?:shows|series)|which (?:shows|series)|my (?:shows|series)|tv library|"
+    r"(?:shows|series) (?:do i have|on (?:the |my )?(?:pi|plex|jellyfin|sonarr|homelab))|"
+    r"list (?:my )?(?:shows|series)|show (?:me )?(?:my )?(?:shows|series))\b",
+    re.I,
+)
+
+_CAL_LIST = re.compile(
+    r"^(?:what(?:'s| is) (?:on )?(?:my )?(?:calendar|schedule)|"
+    r"(?:show|check|read) (?:my )?(?:calendar|schedule)|"
+    r"any (?:meetings?|events?|appointments?)|"
+    r"what(?:'s| is) coming up)(?:\s+(.+))?$",
+    re.I,
+)
+
+_CAL_CREATE = re.compile(
+    r"\b(?:schedule|book|add|create|put)\b.+\b(?:meeting|event|appointment|on my calendar|reminder)\b"
+    r"|\b(?:meeting|event|appointment)\b.+\b(?:schedule|book|add|create)\b",
+    re.I,
+)
+
+_UNREAD_MAIL = re.compile(
+    r"^(?:(?:any|check|show|read|get) )?(?:my )?(?:unread )?(?:emails?|e-?mails?|inbox|gmail|mail)"
+    r"(?:s)?(?:\s+(?:today|for me))?$",
+    re.I,
+)
+
+_SEND_MAIL = re.compile(
+    r"\b(?:email|e-mail|send (?:an )?email to|draft (?:an )?email)\b",
+    re.I,
+)
+
+_WEB_SEARCH = re.compile(
+    r"^(?:search the web(?: for)?|google|look up|look this up)\s+(.+)$",
+    re.I,
+)
+
+_IMESSAGE = re.compile(
+    r"^(?:text|message|imessage|i message|sms)\s+"
+    r"(?:to\s+)?(.+?)\s+"
+    r"(?:that|saying|and say|and tell (?:them|him|her)|:)\s+"
+    r"(.+)$",
+    re.I,
+)
+
+_IMESSAGE_FORCE = re.compile(
+    r"^(?:text|message|imessage|i message|sms)\s+(?:to\s+)?(?!from\b).+$",
+    re.I,
+)
+
+# Read/search local texts — must win over send.
+_IMESSAGE_QUERY = re.compile(
+    r"\b(?:what(?:'s| is| did)|(?:any|check|show|read|search|find|get))\b"
+    r".+\b(?:texts?|messages?|imessages?|sms)\b"
+    r"|\b(?:did|has|have)\s+\S.+\b(?:text|message|imessage)(?:d|s)?(?:\s+me)?\b"
+    r"|\b(?:texts?|messages?|imessages?)\s+(?:from|about|containing|mentioning)\b"
+    r"|\b(?:unread|recent|latest|last)\s+(?:few\s+)?(?:texts?|messages?)\b"
+    r"|\b(?:search|find|look through)\s+(?:my\s+)?(?:texts?|messages?)\b",
+    re.I,
+)
+
+_IMESSAGE_RECENT = re.compile(
+    r"^(?:(?:any|check|show|read|get|what(?:'s| is))\s+)?"
+    r"(?:my\s+)?"
+    r"(?:unread\s+|recent\s+|latest\s+|last\s+(?:few\s+)?)?"
+    r"(?:texts?|messages?|imessages?|sms)"
+    r"(?:\s+(?:today|for me))?$",
+    re.I,
+)
+
+_IMESSAGE_FROM = re.compile(
+    r"\bfrom\s+(?!today\b|yesterday\b|this week\b|last week\b|last \d+ days\b)"
+    r"(.+?)(?:\s+(?:today|yesterday|this week|last week|"
+    r"last \d+ days|about|containing|mentioning|for)\b|$)",
+    re.I,
+)
+
+_IMESSAGE_DID = re.compile(
+    r"\bwhat did\s+(.+?)\s+(?:just\s+)?(?:text|message|imessage)"
+    r"|\b(?:did|has|have)\s+(.+?)\s+(?:just\s+)?(?:text(?:ed)?|message(?:d)?|imessage)"
+    r"(?:d)?(?:\s+me)\b",
+    re.I,
+)
+
+_IMESSAGE_ABOUT = re.compile(
+    r"\b(?:search|find|look through)\s+(?:my\s+)?(?:texts?|messages?).+?"
+    r"\b(?:for|about)\s+(.+)$"
+    r"|\b(?:about|containing|mentioning)\s+(.+)$",
+    re.I,
+)
+
+_CONTENT = re.compile(
+    r"\b(?:linkedin|tweet|twitter|x post|social post|write a post|draft (?:a |some )?content|capture (?:this )?idea)\b",
+    re.I,
+)
+
+_NOTION = re.compile(
+    r"\b(?:notion|note to self|save (?:this|that) (?:note|page)|search notion)\b",
+    re.I,
+)
+
+_PERIODS = re.compile(
+    r"\b(today|tomorrow|yesterday|this week|next week|last week|"
+    r"last \d+ days|last 7 days|last 30 days)\b",
+    re.I,
+)
+
+
+def strip_wake(transcript: str) -> str:
+    """Drop 'Hey Jarvis/Ultron' so Claude doesn't spend a sentence on the name."""
+    t = transcript.strip()
+    if not t:
+        return t
+    stripped = _WAKE_PREFIX.sub("", t, count=1).strip()
+    return stripped if stripped else "Hello."
+
+
+def _to_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    s = value.strip().lower()
+    if s.isdigit():
+        n = int(s)
+        return n if n > 0 else None
+    return _ORDINAL.get(s)
+
+
+def _clean_title(title: str) -> str:
+    t = title.strip(" .")
+    t = re.sub(r"\s+for me$", "", t, flags=re.I)
+    t = re.sub(r"^(?:the )?(?:show|series|tv show)\s+", "", t, flags=re.I)
+    t = re.sub(r"\s+on\s+(?:jellyfin|plex|(?:the |my )?pi)$", "", t, flags=re.I)
+    return t.strip(" .")
+
+
+def _episode_intent(t: str) -> Intent | None:
+    m = _WATCH_EPISODE.search(t)
+    if not m:
+        return None
+    g = m.groups()
+    if g[2]:
+        season, episode, title = g[0], g[1], g[2]
+    elif g[3]:
+        title, season, episode = g[3], g[4], g[5]
+    else:
+        title, season, episode = g[6], g[7], g[8]
+    title = _clean_title(title or "")
+    season_n = _to_int(season)
+    episode_n = _to_int(episode)
+    if not title or not season_n or not episode_n:
+        return Intent("force", "play_movie", None, "homelab", "watch episode")
+    return Intent(
+        "execute",
+        "play_movie",
+        {"title": title, "season": season_n, "episode": episode_n},
+        "homelab",
+        f"watch {title} S{season_n:02d}E{episode_n:02d}",
+    )
+
+
+def _normalize(transcript: str) -> str:
+    t = transcript.strip().lower()
+    t = re.sub(r"[.?!,:;]+$", "", t)
+    t = re.sub(r"\s+please$", "", t)
+    t = re.sub(r"\s+for me$", "", t)
+    for _ in range(3):
+        nxt = _PREFIX.sub("", t).strip()
+        if nxt == t:
+            break
+        t = nxt
+    if _GARBLED_WAKE.match(t):
+        t = _GARBLED_WAKE.sub("", t).strip()
+    t = re.sub(r"\s+please$", "", t)
+    t = re.sub(r"\s+for me$", "", t)
+    return t.strip()
+
+
+def _families(text: str) -> list[str]:
+    return [name for name, pat in _FAMILY_KEYWORDS if pat.search(text)]
+
+
+def _spotify_type(normalized: str) -> str:
+    if re.search(r"\bplaylists?\b", normalized):
+        return "playlist"
+    if re.search(r"\bartists?\b", normalized):
+        return "artist"
+    return "track"
+
+
+def _cal_period(tail: str | None) -> str:
+    if not tail:
+        return "today"
+    m = _PERIODS.search(tail)
+    return m.group(1).lower() if m else "today"
+
+
+def match_intent(transcript: str) -> Intent | None:
+    """Return a routing intent, or None to use the full Claude tool loop."""
+    if not transcript or not transcript.strip():
+        return None
+
+    t = _normalize(transcript)
+    if not t:
+        return None
+
+    if _NEGATE.search(t):
+        return None
+
+    # Chained verbs across actions → Claude orchestrates.
+    if _COMPOUND.search(t):
+        return None
+
+    elsewhere = _WEATHER_ELSEWHERE.search(t)
+    if elsewhere:
+        place = elsewhere.group(1).strip(" .")
+        return Intent(
+            "execute", "web_search",
+            {"query": f"weather in {place}", "max_results": 3},
+            "search", f"weather {place}",
+        )
+    if _CONTEXT_ONLY.match(t):
+        return None  # already in the context block
+
+    # ── Spotify controls (no args) ────────────────────────────────────────────
+    if _PAUSE.match(t):
+        return Intent("execute", "pause_spotify", {}, "spotify", "pause")
+    if _SKIP.match(t):
+        return Intent("execute", "skip_spotify", {}, "spotify", "skip")
+    if _RESUME.match(t):
+        return Intent("execute", "resume_spotify", {}, "spotify", "resume")
+    if _NOW_PLAYING.match(t):
+        return Intent("execute", "get_currently_playing", {}, "spotify", "now playing")
+
+    # ── Podcast (before "play …" so "play my podcast" isn't Spotify) ──────────
+    if _PODCAST.search(t):
+        return Intent("execute", "generate_daily_podcast", {}, "podcast", "podcast")
+
+    if _PI_STATUS.match(t):
+        return Intent("execute", "pi_get_status", {}, "homelab", "pi status")
+    if _PI_MOVIES.search(t):
+        return Intent("execute", "pi_list_movies", {}, "homelab", "list movies")
+    if _PI_SHOWS.search(t):
+        return Intent("execute", "pi_list_series", {}, "homelab", "list series")
+
+    open_lab = _OPEN_HOMELAB.match(t)
+    if open_lab:
+        from integrations.homelab_web import resolve_apps
+        target = (open_lab.group(1) or "").strip(" .")
+        if resolve_apps(target):
+            return Intent(
+                "execute", "open_homelab", {"app": target},
+                "homelab", f"open {target}",
+            )
+
+    episode = _episode_intent(t)
+    if episode:
+        return episode
+
+    watch = _WATCH_MOVIE.match(t)
+    if watch:
+        title = _clean_title(next((g for g in watch.groups() if g), ""))
+        if title:
+            return Intent(
+                "execute", "play_movie", {"title": title}, "homelab", f"watch {title}",
+            )
+        return Intent("force", "play_movie", None, "homelab", "watch movie")
+
+    # ── Play / put on ─────────────────────────────────────────────────────────
+    play = _PLAY.match(t)
+    if play and not _NOT_MUSIC.search(t):
+        query = re.sub(r"\s+on\s+spotify$", "", play.group(1).strip()).strip(" .")
+        query = re.sub(r"^(?:the artist|artist)\s+", "", query).strip()
+        if not query or _VAGUE_PLAY.match(query):
+            return Intent("force", "play_spotify", None, "spotify", "play (vague)")
+        if _BARE_MUSIC.match(query):
+            return Intent(
+                "execute", "play_spotify",
+                {"query": "discover weekly", "type": "playlist"},
+                "spotify", "play default",
+            )
+        return Intent(
+            "execute", "play_spotify",
+            {"query": query, "type": _spotify_type(t)},
+            "spotify", f"play {query}",
+        )
+
+    # ── Screen vision (screenshot is pre-attached in brain) ───────────────────
+    try:
+        from integrations.screen import looks_like_screen_question
+        if looks_like_screen_question(transcript):
+            return Intent("filter", family="screen", note="screen vision")
+    except Exception:
+        pass
+
+    # ── Calendar ──────────────────────────────────────────────────────────────
+    if _CAL_CREATE.search(t):
+        return Intent("force", "create_calendar_event", None, "calendar", "create event")
+    cal = _CAL_LIST.match(t)
+    if cal:
+        period = _cal_period(cal.group(1))
+        return Intent(
+            "execute", "list_calendar_events", {"period": period},
+            "calendar", f"calendar {period}",
+        )
+
+    # ── Gmail ─────────────────────────────────────────────────────────────────
+    if _UNREAD_MAIL.match(t):
+        return Intent(
+            "execute", "search_gmail", {"query": "is:unread", "max_results": 5},
+            "gmail", "unread mail",
+        )
+    if _SEND_MAIL.search(t):
+        tool = "draft_gmail" if "draft" in t else "send_gmail"
+        return Intent("force", tool, None, "gmail", tool)
+
+    # ── Web search ────────────────────────────────────────────────────────────
+    web = _WEB_SEARCH.match(t)
+    if web:
+        q = web.group(1).strip(" .")
+        if q:
+            return Intent("execute", "web_search", {"query": q, "max_results": 3}, "search", f"search {q}")
+
+    # ── iMessage (query before send so "texts from mom" is not a send) ─────────
+    if _IMESSAGE_QUERY.search(t):
+        args: dict = {}
+        who = _IMESSAGE_FROM.search(t) or _IMESSAGE_DID.search(t)
+        if who:
+            name = next((g for g in who.groups() if g), "")
+            if name:
+                args["contact"] = name.strip(" .")
+        about = _IMESSAGE_ABOUT.search(t)
+        if about:
+            args["query"] = (about.group(1) or about.group(2) or "").strip(" .")
+        period = _PERIODS.search(t)
+        if period:
+            args["since"] = period.group(1).lower()
+        if args or _IMESSAGE_RECENT.match(t):
+            args.setdefault("max_results", 15)
+            note = args.get("contact") or args.get("query") or "recent texts"
+            return Intent(
+                "execute", "search_imessage", args, "messages", f"search texts {note}",
+            )
+        return Intent("force", "search_imessage", None, "messages", "search texts")
+
+    im = _IMESSAGE.match(t)
+    if im:
+        return Intent(
+            "execute", "send_imessage",
+            {"to": im.group(1).strip(), "message": im.group(2).strip()},
+            "messages", "imessage",
+        )
+    if _IMESSAGE_FORCE.match(t):
+        return Intent("force", "send_imessage", None, "messages", "imessage (incomplete)")
+
+    # ── Content / Notion ──────────────────────────────────────────────────────
+    if _CONTENT.search(t):
+        return Intent("force", "generate_content", None, "content", "content")
+    if _NOTION.search(t):
+        return Intent("filter", family="notion", note="notion")
+
+    # ── Domain keyword fallback ───────────────────────────────────────────────
+    families = _families(t)
+    if len(families) == 1:
+        fam = families[0]
+        return Intent("filter", family=fam, note=f"{fam} family")
+
+    return None
