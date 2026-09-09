@@ -57,6 +57,18 @@ def playback_state() -> dict | None:
         return None
 
 
+def pause_for_voice() -> bool:
+    """Pause active playback after a single playback-state request."""
+    current = playback_state()
+    if not current or not current.get("is_playing"):
+        return False
+    device = _active_device_id(current)
+    if not device:
+        return False
+    _client().pause_playback(device_id=device)
+    return True
+
+
 def _device_list(sp=None) -> list[dict]:
     sp = sp or _client()
     return (sp.devices() or {}).get("devices") or []

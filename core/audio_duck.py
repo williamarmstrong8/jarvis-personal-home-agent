@@ -9,6 +9,7 @@ asked to pause.
 System volume is left untouched (afplay uses it for JARVIS's own voice).
 """
 
+import os
 import threading
 import time
 
@@ -20,7 +21,9 @@ RESET  = "\033[0m"
 _DUCK_TIMEOUT_SECS = 2.0
 
 # Spotify's speaker buffer keeps going after the pause API returns.
-_PAUSE_SETTLE_SECS = 0.3
+_PAUSE_SETTLE_SECS = max(
+    0.0, float(os.environ.get("SPOTIFY_DUCK_SETTLE_SECS", "0.20"))
+)
 # Resume blast otherwise retriggers OpenWakeWord (lyrics ≈ "Hey Jarvis").
 _RESTORE_WAKE_SUPPRESS_SECS = 2.5
 
@@ -52,12 +55,11 @@ def duck() -> bool:
 
     def _go():
         try:
-            from integrations.spotify import is_playing, pause
-            if not is_playing():
+            from integrations.spotify import pause_for_voice
+            if not pause_for_voice():
                 print(f"{CYAN}[DUCK] Spotify not playing — nothing to duck{RESET}", flush=True)
                 return
             print(f"{CYAN}[DUCK] Pausing Spotify{RESET}", flush=True)
-            pause()
             time.sleep(_PAUSE_SETTLE_SECS)
             box["ok"] = True
         except Exception as exc:

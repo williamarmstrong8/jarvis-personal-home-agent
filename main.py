@@ -68,17 +68,22 @@ BANNER = f"""{RED}
 # ── Audio constants ────────────────────────────────────────────────────────────
 SAMPLE_RATE        = 16000
 CHUNK_SIZE         = 1280          # 80 ms at 16 kHz — required by OpenWakeWord
-VAD_SILENCE_SECS   = 1.0          # 1s of silence before we cut the recording
-VAD_RMS_THRESHOLD  = 200
-MAX_RECORD_SECS    = 10
+VAD_FRAME_MS       = max(10, min(80, int(os.environ.get("VAD_FRAME_MS", "30"))))
+RECORD_CHUNK_SIZE  = max(160, int(SAMPLE_RATE * VAD_FRAME_MS / 1000))
+VAD_SILENCE_SECS   = float(os.environ.get("VAD_SILENCE_SECS", "0.36"))
+VAD_MIN_RMS        = float(os.environ.get("VAD_MIN_RMS", "120"))
+VAD_NOISE_MULTIPLIER = float(os.environ.get("VAD_NOISE_MULTIPLIER", "2.5"))
+VAD_MAX_RMS        = float(os.environ.get("VAD_MAX_RMS", "800"))
+MAX_RECORD_SECS    = float(os.environ.get("MAX_RECORD_SECS", "10"))
 
 # Wake word detection threshold (0–1). Lower = more sensitive / more false positives.
-WAKE_THRESHOLD = 0.3
+WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.3"))
 
 # ── Shared async loop + event ─────────────────────────────────────────────────
 _async_loop: asyncio.AbstractEventLoop | None = None
 _loop_ready = threading.Event()
 _running = True
+_noise_floor_rms = 60.0
 
 
 def _request_stop(signum=None, frame=None):
@@ -87,31 +92,53 @@ def _request_stop(signum=None, frame=None):
     _running = False
 
 
-def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SECS) -> bytes:
+def _rms(data: bytes) -> float:
+    pcm = np.frombuffer(data, dtype=np.int16)
+    if pcm.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+
+
+def _vad_threshold() -> float:
+    return min(VAD_MAX_RMS, max(VAD_MIN_RMS, _noise_floor_rms * VAD_NOISE_MULTIPLIER))
+
+
+def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SECS,
+                         trace=None) -> bytes:
     """
     Keep reading the already-open mic until silence or max duration.
-    seed_frames (preroll) are prepended but not used for VAD, so we don't
-    cut off just because the tail of 'Hey Jarvis' went quiet.
+    seed_frames (preroll) are prepended. Only their recent tail is considered
+    for VAD so a command captured during Spotify ducking can end promptly.
     """
     frames = list(seed_frames)
     silent_chunks = 0
-    silence_limit = int(VAD_SILENCE_SECS * SAMPLE_RATE / CHUNK_SIZE)
-    max_chunks    = int(max_secs * SAMPLE_RATE / CHUNK_SIZE)
+    silence_limit = max(2, int(round(VAD_SILENCE_SECS * SAMPLE_RATE / RECORD_CHUNK_SIZE)))
+    max_chunks    = max(1, int(max_secs * SAMPLE_RATE / RECORD_CHUNK_SIZE))
+    threshold     = _vad_threshold()
+    # Audio captured while Spotify is being paused may already contain the
+    # complete command. Inspect only the recent tail, never the older wake-word
+    # preroll, so music before the trigger does not count as user speech.
+    speech_seen = any(_rms(frame) >= threshold for frame in frames[-12:])
 
-    log("Recording…")
+    log(f"Recording… (adaptive threshold={threshold:.0f})")
+    if trace and "recording_started" not in trace.marks:
+        trace.mark("recording_started")
     while len(frames) - len(seed_frames) < max_chunks:
-        data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+        data = stream.read(RECORD_CHUNK_SIZE, exception_on_overflow=False)
         frames.append(data)
-        pcm = np.frombuffer(data, dtype=np.int16)
-        rms = np.sqrt(np.mean(pcm.astype(np.float32) ** 2))
-        if rms < VAD_RMS_THRESHOLD:
+        level = _rms(data)
+        if level < threshold:
             silent_chunks += 1
             recorded = len(frames) - len(seed_frames)
-            if silent_chunks >= silence_limit and recorded > silence_limit:
+            if silent_chunks >= silence_limit and (speech_seen or recorded > silence_limit):
                 break
         else:
+            speech_seen = True
             silent_chunks = 0
 
+    if trace:
+        trace.mark("speech_ended")
+        trace.set("vad_threshold", round(threshold, 1))
     return b"".join(frames)
 
 
@@ -177,6 +204,24 @@ def _silence_spotify() -> bool:
         return False
 
 
+def _silence_spotify_while_capturing(stream) -> tuple[bool, list[bytes]]:
+    """Pause Spotify without dropping words spoken during the API round trip."""
+    box = {"silenced": False}
+    done = threading.Event()
+
+    def _go():
+        try:
+            box["silenced"] = _silence_spotify()
+        finally:
+            done.set()
+
+    threading.Thread(target=_go, daemon=True, name="jarvis-duck-capture").start()
+    captured: list[bytes] = []
+    while not done.is_set():
+        captured.append(stream.read(CHUNK_SIZE, exception_on_overflow=False))
+    return bool(box["silenced"]), captured
+
+
 SUIT_UP_TRIGGERS = {
     "suit up", "initialize", "run startup sequence",
     "boot sequence", "power up",
@@ -184,30 +229,37 @@ SUIT_UP_TRIGGERS = {
 
 
 def process_command(wav_path: str, is_followup: bool = False,
-                    history: list[dict] | None = None):
+                    history: list[dict] | None = None, trace=None):
     """Full pipeline: STT → brain → TTS. duck() is called by the wake loop before this."""
-    from core.speech      import transcribe, speak, SpeechQueue, for_speech, release_speaking
+    from core.speech      import (
+        transcribe, speak, SpeechQueue, for_speech, release_speaking,
+        selected_stt_backend,
+    )
     from core.brain       import process_streaming
     from core.ws_server   import broadcast
     from core.context     import get_context_block
     from core.audio_duck  import restore
 
+    from core.latency import LatencyTrace
+
+    trace = trace or LatencyTrace("followup" if is_followup else "command")
+    trace.set("is_followup", is_followup)
+    trace.set("stt_backend", selected_stt_backend())
+    trace.set("vad_frame_ms", VAD_FRAME_MS)
+    trace.set("vad_silence_secs", VAD_SILENCE_SECS)
     t_pipe = time.time()
+    trace.mark("stt_started")
     transcript = transcribe(wav_path)
+    trace.mark("stt_completed")
+    trace.set("transcript_chars", len(transcript))
     os.unlink(wav_path)
 
     if not transcript.strip():
         warn("Empty transcript — skipping")
         restore()
         run_async(broadcast({"event": "idle"}))
-        from core.brain import generate_in_character
-        line = run_async(generate_in_character(
-            "The user's speech was empty or unintelligible. "
-            "Acknowledge that you didn't catch it.",
-            max_tokens=40,
-        ))
-        if line:
-            speak(line)
+        speak("I didn't catch that, sir.")
+        trace.finish("empty_transcript")
         return
 
     log(f"Transcript: {transcript}")
@@ -224,6 +276,7 @@ def process_command(wav_path: str, is_followup: bool = False,
         run_async(run_suit_up_sequence(broadcast, speak, get_context_block))
         if _ambient:
             _ambient.notify_state("standby")
+        trace.finish("suit_up")
         return
 
     # ── Normal pipeline ───────────────────────────────────────────────────────
@@ -233,7 +286,11 @@ def process_command(wav_path: str, is_followup: bool = False,
     run_async(broadcast({"event": "thinking"}))
 
     # Speak each sentence as it streams; prefetch the next while the current plays.
-    speech_q = SpeechQueue()
+    speech_q = SpeechQueue(
+        on_tts_start=lambda: trace.mark("tts_started"),
+        on_tts_ready=lambda: trace.mark("tts_first_byte"),
+        on_first_audio=lambda: trace.mark("first_audio"),
+    )
     speech_q.start()
     spoken_parts: list[str] = []
     first_spoken = False
@@ -248,16 +305,30 @@ def process_command(wav_path: str, is_followup: bool = False,
         spoken_parts.append(cleaned)
         if not first_spoken:
             first_spoken = True
+            trace.mark("response_ready")
             await broadcast({"event": "speaking"})
             if _ambient:
                 _ambient.notify_state("speaking")
             log(f"Time-to-speech enqueue {time.time() - t_pipe:.2f}s from pipeline start")
         speech_q.enqueue(cleaned)
+        if len(spoken_parts) == 1:
+            trace.mark("tts_enqueued")
 
     try:
         full_response, needs_followup = run_async(
-            process_streaming(transcript, broadcast, on_sentence, history=history)
+            process_streaming(
+                transcript, broadcast, on_sentence, history=history, trace=trace
+            )
         )
+    except Exception as exc:
+        err(f"Command pipeline failed: {exc}")
+        trace.set("error", str(exc)[:240])
+        restore()
+        run_async(broadcast({"event": "idle"}))
+        if _ambient:
+            _ambient.notify_state("standby")
+        trace.finish("error")
+        return
     finally:
         speech_q.finish()
         release_speaking()
@@ -278,6 +349,7 @@ def process_command(wav_path: str, is_followup: bool = False,
         run_async(broadcast({"event": "idle"}))
         if _ambient:
             _ambient.notify_state("standby")
+    trace.finish("followup" if needs_followup else "ok")
 
 
 _ambient = None   # global AmbientPresence instance
@@ -465,12 +537,12 @@ def main():
     from core.speech import warmup, is_speaking
     threading.Thread(target=warmup, daemon=True).start()
 
-    # Pre-warm context module — triggers Google OAuth in background before first voice cmd
+    # Maintain a hot context snapshot; voice turns never wait for these APIs.
     def _warmup_context():
         try:
-            from core.context import get_context_block
-            block = get_context_block()
-            ok(f"Context ready")
+            from core.context import start_background_refresh
+            start_background_refresh()
+            ok("Context refresh running")
         except Exception as exc:
             warn(f"Context warmup failed: {exc}")
     threading.Thread(target=_warmup_context, daemon=True).start()
@@ -545,21 +617,33 @@ def main():
 
             # ── Check for pending follow-up BEFORE reading wake word audio ────
             if _followup_event.is_set():
+                from core.latency import LatencyTrace
+                trace = LatencyTrace("followup")
                 _followup_event.clear()
                 fire_async(broadcast({"event": "followup_listening"}))
                 if _ambient:
                     _ambient.notify_state("listening")
-                pcm_data = record_until_silence(wake_stream, max_secs=8.0)
+                pcm_data = record_until_silence(
+                    wake_stream, max_secs=8.0, trace=trace
+                )
                 wav_path = pcm_to_wav(pcm_data)
+                trace.mark("wav_ready")
                 _run_command(
                     wake_stream, oww_model, preroll,
                     wav_path=wav_path, is_followup=True,
-                    history=_conversation_history,
+                    history=_conversation_history, trace=trace,
                 )
                 continue
 
             raw = wake_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             pcm = np.frombuffer(raw, dtype=np.int16)
+
+            # Track the quiet-room baseline used by adaptive endpointing. Loud
+            # transients and music are excluded so they cannot pin the threshold.
+            global _noise_floor_rms
+            level = _rms(raw)
+            if level < max(300.0, _noise_floor_rms * 3.0):
+                _noise_floor_rms = 0.985 * _noise_floor_rms + 0.015 * level
 
             # Keep rolling buffer of recent audio for pre-roll
             preroll.append(raw)
@@ -584,6 +668,9 @@ def main():
                     continue
                 last_triggered = now
                 t_wake = now
+                from core.latency import LatencyTrace
+                trace = LatencyTrace("wake")
+                trace.mark("wake_detected")
                 print()  # newline after the score readout
                 ok("Wake word detected!")
                 oww_model.reset()
@@ -600,18 +687,30 @@ def main():
                 if _ambient:
                     _ambient.notify_state("listening")
 
-                # Pause Spotify *before* recording. Volume-ducking still leaks
-                # lyrics into Whisper, and preroll is ~1.6s of that music.
-                silenced = _silence_spotify()
-                seed = () if silenced else preroll_audio
+                # Keep reading the mic while Spotify is paused. When music was
+                # active retain only the final 240ms of wake audio plus everything
+                # captured during the pause, preserving run-on commands without
+                # feeding 1.6 seconds of lyrics to transcription.
+                trace.mark("recording_started")
+                trace.mark("duck_started")
+                silenced, duck_audio = _silence_spotify_while_capturing(wake_stream)
+                trace.mark("duck_completed")
+                trace.set("spotify_ducked", silenced)
+                seed = (
+                    preroll_audio[-3:] + duck_audio
+                    if silenced else preroll_audio + duck_audio
+                )
 
-                log(f"Listening immediately ({(time.time() - t_wake) * 1000:.0f}ms after wake)")
-                pcm_data = record_until_silence(wake_stream, seed_frames=seed)
+                log(f"Live capture active ({(time.time() - t_wake) * 1000:.0f}ms after wake)")
+                pcm_data = record_until_silence(
+                    wake_stream, seed_frames=seed, trace=trace
+                )
                 wav_path = pcm_to_wav(pcm_data)
+                trace.mark("wav_ready")
 
                 _run_command(
                     wake_stream, oww_model, preroll,
-                    wav_path=wav_path, history=_conversation_history,
+                    wav_path=wav_path, history=_conversation_history, trace=trace,
                 )
 
     except KeyboardInterrupt:

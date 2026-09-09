@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -30,6 +31,9 @@ _weather_cache:  tuple | None = None
 _calendar_cache: tuple | None = None
 _gmail_cache:    tuple | None = None
 _block_cache:    tuple | None = None   # (text, timestamp)
+_refresh_lock = threading.Lock()
+_refresh_thread: threading.Thread | None = None
+_background_started = False
 
 WEATHER_TTL  = 600   # 10 minutes
 CALENDAR_TTL = 120   # 2 minutes
@@ -268,48 +272,151 @@ def _safe_result(fut, default, timeout: float):
         return default
 
 
-def get_context_block() -> str:
+def _minimal_context_block() -> str:
+    """Return local-only context while the first network snapshot warms."""
+    t = get_time_info()
+    return (
+        "--- CURRENT CONTEXT ---\n"
+        f"TIME: {t['time']}, {t['weekday']}\n"
+        f"DATE: {t['date']}\n"
+        f"PERIOD: {t['period']}\n"
+        "WEATHER: warming in background\n"
+        "NEXT EVENT: warming in background\n"
+        "UNREAD EMAILS: warming in background\n"
+        "BATTERY: warming in background\n"
+        "-----------------------"
+    )
+
+
+def refresh_context_block() -> str:
     """
-    Build and return the formatted context string injected into every
-    Claude system prompt. Completes in <500ms; all fields degrade gracefully.
-    Weather/calendar/gmail/battery are fetched in parallel.
+    Refresh the shared context snapshot. This may perform network I/O and is
+    intended for the background refresher, never the live voice path.
     """
     global _block_cache
-    try:
-        now_ts = time.time()
-        if _block_cache and (now_ts - _block_cache[1]) < BLOCK_TTL:
-            return _block_cache[0]
+    with _refresh_lock:
+        try:
+            now_ts = time.time()
+            t = get_time_info()
+            f_battery = _ctx_pool.submit(get_battery)
+            f_weather = _ctx_pool.submit(get_weather)
+            f_event   = _ctx_pool.submit(get_next_event)
+            f_unread  = _ctx_pool.submit(get_unread_count)
 
-        t = get_time_info()
-        f_battery = _ctx_pool.submit(get_battery)
-        f_weather = _ctx_pool.submit(get_weather)
-        f_event   = _ctx_pool.submit(get_next_event)
-        f_unread  = _ctx_pool.submit(get_unread_count)
+            battery = _safe_result(f_battery, None, 3)
+            weather = _safe_result(f_weather, "weather unavailable", 4)
+            event   = _safe_result(f_event, None, 4)
+            unread  = _safe_result(f_unread, None, 4)
 
-        battery = _safe_result(f_battery, None, 3)
-        weather = _safe_result(f_weather, "weather unavailable", 4)
-        event   = _safe_result(f_event, None, 4)
-        unread  = _safe_result(f_unread, None, 4)
+            time_str   = f"{t['time']}, {t['weekday']}"
+            bat_str    = f"{battery}%" if battery is not None else "unavailable"
+            unread_str = str(unread)   if unread  is not None else "unavailable"
+            event_str  = (f"{event['title']} in {event['minutes_away']} minutes"
+                          if event else "none today")
 
-        time_str   = f"{t['time']}, {t['weekday']}"
-        bat_str    = f"{battery}%" if battery is not None else "unavailable"
-        unread_str = str(unread)   if unread  is not None else "unavailable"
-        event_str  = (f"{event['title']} in {event['minutes_away']} minutes"
-                      if event else "none today")
+            block = (
+                "--- CURRENT CONTEXT ---\n"
+                f"TIME: {time_str}\n"
+                f"DATE: {t['date']}\n"
+                f"PERIOD: {t['period']}\n"
+                f"WEATHER: {weather}\n"
+                f"NEXT EVENT: {event_str}\n"
+                f"UNREAD EMAILS: {unread_str}\n"
+                f"BATTERY: {bat_str}\n"
+                "-----------------------"
+            )
+            _block_cache = (block, now_ts)
+            return block
+        except Exception as exc:
+            log.warning("refresh_context_block fatal error: %s", exc)
+            if _block_cache:
+                return _block_cache[0]
+            return _minimal_context_block()
 
-        block = (
-            "--- CURRENT CONTEXT ---\n"
-            f"TIME: {time_str}\n"
-            f"DATE: {t['date']}\n"
-            f"PERIOD: {t['period']}\n"
-            f"WEATHER: {weather}\n"
-            f"NEXT EVENT: {event_str}\n"
-            f"UNREAD EMAILS: {unread_str}\n"
-            f"BATTERY: {bat_str}\n"
-            "-----------------------"
-        )
-        _block_cache = (block, now_ts)
-        return block
-    except Exception as exc:
-        log.warning("get_context_block fatal error: %s", exc)
-        return "--- CURRENT CONTEXT ---\n[context unavailable]\n-----------------------"
+
+def _schedule_refresh() -> None:
+    global _refresh_thread
+    if _refresh_thread and _refresh_thread.is_alive():
+        return
+    _refresh_thread = threading.Thread(
+        target=refresh_context_block,
+        daemon=True,
+        name="jarvis-context-refresh",
+    )
+    _refresh_thread.start()
+
+
+def start_background_refresh(interval_seconds: float = 30.0) -> None:
+    """Continuously refresh context without adding latency to voice turns."""
+    global _background_started, _refresh_thread
+    if _background_started:
+        return
+    _background_started = True
+
+    def _loop():
+        while True:
+            refresh_context_block()
+            time.sleep(max(10.0, interval_seconds))
+
+    _refresh_thread = threading.Thread(
+        target=_loop, daemon=True, name="jarvis-context-loop"
+    )
+    _refresh_thread.start()
+
+
+def get_context_block() -> str:
+    """Return the latest snapshot immediately and refresh stale data in the background."""
+    now_ts = time.time()
+    if _block_cache:
+        if now_ts - _block_cache[1] >= BLOCK_TTL:
+            _schedule_refresh()
+        return _block_cache[0]
+    _schedule_refresh()
+    return _minimal_context_block()
+
+
+def direct_context_response(kind: str) -> str:
+    """Return a speech-ready answer from the hot snapshot without an LLM call.
+
+    Network-backed values deliberately use the last completed background
+    snapshot. A voice turn must never turn a simple context question into a
+    synchronous weather/Google request.
+    """
+    kind = (kind or "").strip().lower()
+    now = datetime.now()
+    if kind == "time":
+        return f"It is {now.strftime('%-I:%M %p')}, sir."
+    if kind == "date":
+        return f"Today is {now.strftime('%A, %B %-d, %Y')}, sir."
+
+    block = get_context_block()
+
+    def _field(label: str) -> str:
+        match = re.search(rf"^{re.escape(label)}:\s*(.+)$", block, re.MULTILINE)
+        return match.group(1).strip() if match else ""
+
+    if kind == "weather":
+        value = _field("WEATHER")
+        if value and "warming in background" not in value:
+            return f"It is {value}, sir."
+        return "The weather snapshot is still warming up, sir."
+    if kind == "battery":
+        value = _field("BATTERY")
+        if value and value not in ("unavailable", "warming in background"):
+            return f"The Mac battery is at {value}, sir."
+        return "The battery level is currently unavailable, sir."
+    if kind == "next_event":
+        value = _field("NEXT EVENT")
+        if value == "none today":
+            return "There are no more events on your calendar today, sir."
+        if value and value not in ("unavailable", "warming in background"):
+            return f"Your next event is {value}, sir."
+        return "Your calendar snapshot is still warming up, sir."
+    if kind == "unread_count":
+        value = _field("UNREAD EMAILS")
+        if value.isdigit():
+            count = int(value)
+            noun = "message" if count == 1 else "messages"
+            return f"You have {count} unread {noun}, sir."
+        return "Your unread mail count is currently unavailable, sir."
+    return "That context value is unavailable, sir."

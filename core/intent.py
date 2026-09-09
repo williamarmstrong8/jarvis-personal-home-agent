@@ -8,6 +8,7 @@ Modes:
   execute — args are complete; run the tool now, Claude only speaks
   force   — we know the tool; Claude fills args (tool_choice forced)
   filter  — we know the domain; send only that family's tools
+  chat    — clearly conversational; stream the model without tool schemas
   None    — mixed / unclear; full Claude with every tool
 """
 
@@ -156,6 +157,38 @@ _CONTEXT_ONLY = re.compile(
     re.I,
 )
 
+_TIME_QUERY = re.compile(r"^(?:what(?:'s| is) the time|what time is it|time)$", re.I)
+_DATE_QUERY = re.compile(
+    r"^(?:what(?:'s| is) (?:the )?date|what day is it|date)(?: today)?$", re.I
+)
+_LOCAL_WEATHER_QUERY = re.compile(
+    r"^(?:(?:what(?:'s| is)|how(?:'s| is)) (?:the )?)?"
+    r"(?:weather|temperature|forecast)(?: today)?$",
+    re.I,
+)
+_BATTERY_QUERY = re.compile(
+    r"^(?:(?:what(?:'s| is)|how(?:'s| is)) (?:the )?)?"
+    r"(?:battery|battery level|battery percentage)$",
+    re.I,
+)
+_NEXT_EVENT_QUERY = re.compile(
+    r"^(?:what(?:'s| is) my next (?:meeting|event|appointment)|"
+    r"when is my next (?:meeting|event|appointment)|next (?:meeting|event|appointment))$",
+    re.I,
+)
+_UNREAD_COUNT_QUERY = re.compile(
+    r"^(?:how many unread (?:emails?|messages?) (?:do i have|are there)|"
+    r"what(?:'s| is) my unread (?:email|mail) count|unread (?:email|mail) count)$",
+    re.I,
+)
+
+_CHAT_ONLY = re.compile(
+    r"^(?:hello|hi|good (?:morning|afternoon|evening|night)|"
+    r"how are you|who are you|what are you|thank you|thanks|"
+    r"tell me a joke|say something witty)$",
+    re.I,
+)
+
 _WEATHER_ELSEWHERE = re.compile(
     r"\b(?:weather|temperature|forecast)\s+in\s+(.+)$",
     re.I,
@@ -248,6 +281,12 @@ _UNREAD_MAIL = re.compile(
 
 _SEND_MAIL = re.compile(
     r"\b(?:email|e-mail|send (?:an )?email to|draft (?:an )?email)\b",
+    re.I,
+)
+
+_STRUCTURED_EMAIL = re.compile(
+    r"^(draft|send) (?:an )?(?:email|e-mail) to\s+(\S+@\S+)\s+"
+    r"subject\s+(.+?)\s+body\s+(.+)$",
     re.I,
 )
 
@@ -396,6 +435,20 @@ def _normalize(transcript: str) -> str:
     return t.strip()
 
 
+def _normalize_preserving_case(transcript: str) -> str:
+    """Apply command-prefix cleanup without lowercasing extracted content."""
+    text = transcript.strip()
+    text = re.sub(r"[.?!,:;]+$", "", text)
+    text = re.sub(r"\s+please$", "", text, flags=re.I)
+    text = re.sub(r"\s+for me$", "", text, flags=re.I)
+    for _ in range(3):
+        cleaned = _PREFIX.sub("", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    return text.strip()
+
+
 def _families(text: str) -> list[str]:
     return [name for name, pat in _FAMILY_KEYWORDS if pat.search(text)]
 
@@ -431,6 +484,9 @@ def match_intent(transcript: str) -> Intent | None:
     if _COMPOUND.search(t):
         return None
 
+    if _CHAT_ONLY.match(t):
+        return Intent("chat", family="chat", note="conversation")
+
     elsewhere = _WEATHER_ELSEWHERE.search(t)
     if elsewhere:
         place = elsewhere.group(1).strip(" .")
@@ -439,8 +495,21 @@ def match_intent(transcript: str) -> Intent | None:
             {"query": f"weather in {place}", "max_results": 3},
             "search", f"weather {place}",
         )
+    for pattern, kind in (
+        (_TIME_QUERY, "time"),
+        (_DATE_QUERY, "date"),
+        (_LOCAL_WEATHER_QUERY, "weather"),
+        (_BATTERY_QUERY, "battery"),
+        (_NEXT_EVENT_QUERY, "next_event"),
+        (_UNREAD_COUNT_QUERY, "unread_count"),
+    ):
+        if pattern.match(t):
+            return Intent(
+                "execute", "get_context_value", {"kind": kind},
+                "context", f"context {kind}",
+            )
     if _CONTEXT_ONLY.match(t):
-        return None  # already in the context block
+        return None
 
     # ── Spotify controls (no args) ────────────────────────────────────────────
     if _PAUSE.match(t):
@@ -525,6 +594,15 @@ def match_intent(transcript: str) -> Intent | None:
         )
 
     # ── Gmail ─────────────────────────────────────────────────────────────────
+    structured_mail = _STRUCTURED_EMAIL.match(_normalize_preserving_case(transcript))
+    if structured_mail:
+        action, recipient, subject, body = structured_mail.groups()
+        tool = "draft_gmail" if action.lower() == "draft" else "send_gmail"
+        return Intent(
+            "execute", tool,
+            {"to": recipient, "subject": subject.strip(), "body": body.strip()},
+            "gmail", f"{tool} structured",
+        )
     if _UNREAD_MAIL.match(t):
         return Intent(
             "execute", "search_gmail", {"query": "is:unread", "max_results": 5},

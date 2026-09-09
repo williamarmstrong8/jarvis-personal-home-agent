@@ -15,6 +15,8 @@ import httpx
 from dotenv import load_dotenv
 
 from .intent import FAMILY_TOOLS, Intent, match_intent, strip_wake
+from .latency import LatencyTrace, mark as mark_latency
+from .responses import direct_response
 
 load_dotenv()
 
@@ -109,13 +111,14 @@ def _system_payload(context_block: str) -> list[dict] | str:
     ]
 
 
-def _all_defs(*, include_screen: bool) -> list[dict]:
+def _all_defs(*, include_screen: bool, include_pi: bool = True) -> list[dict]:
     tools = [t for t in TOOLS if include_screen or t["name"] != "look_at_screen"]
-    try:
-        from integrations.pi_mcp import anthropic_tools
-        tools = tools + anthropic_tools()
-    except Exception:
-        pass
+    if include_pi:
+        try:
+            from integrations.pi_mcp import anthropic_tools
+            tools = tools + anthropic_tools(wait_for_initial=False)
+        except Exception:
+            pass
     return tools
 
 
@@ -186,16 +189,17 @@ def build_system_prompt() -> str:
     return get_context_block() + "\n\n" + JARVIS_BASE_PROMPT
 
 
-def _context_block() -> str:
+def _context_block(*, include_homelab: bool = True, wait_for_pi: bool = False) -> str:
     from .context import get_context_block
     block = get_context_block()
-    try:
-        from integrations.pi_mcp import live_instructions
-        extra = live_instructions()
-        if extra:
-            block = f"{block}\n\n{extra}"
-    except Exception:
-        pass
+    if include_homelab:
+        try:
+            from integrations.pi_mcp import live_instructions
+            extra = live_instructions(wait_for_initial=wait_for_pi)
+            if extra:
+                block = f"{block}\n\n{extra}"
+        except Exception:
+            pass
     return block
 
 TOOLS = [
@@ -486,7 +490,10 @@ def _user_content(transcript: str):
 def _execute_tool(name: str, inputs: dict):
     """Dispatch a tool call to the appropriate integration."""
     try:
-        if name == "open_homelab":
+        if name == "get_context_value":
+            from .context import direct_context_response
+            return direct_context_response(inputs.get("kind") or "")
+        elif name == "open_homelab":
             from integrations.homelab_web import open_homelab
             return open_homelab(inputs.get("app") or "")
         elif name == "play_movie":
@@ -588,7 +595,11 @@ def _execute_tool(name: str, inputs: dict):
 
 def _subset_tools(names: list[str]) -> list[dict]:
     wanted = set(names)
-    return [t for t in _all_defs(include_screen=True) if t["name"] in wanted]
+    include_pi = any(name.startswith("pi_") for name in wanted)
+    return [
+        t for t in _all_defs(include_screen=True, include_pi=include_pi)
+        if t["name"] in wanted
+    ]
 
 
 def _tools_for_turn(
@@ -607,6 +618,9 @@ def _tools_for_turn(
         return _cached_tools(), None, 1024
 
     if intent.mode == "execute":
+        return [], None, 256
+
+    if intent.mode == "chat":
         return [], None, 256
 
     if intent.mode == "force" and intent.tool:
@@ -661,19 +675,21 @@ def _apply_tools_payload(
 async def _turn_setup(
     transcript: str,
     broadcast: Callable[[dict], Awaitable[None]],
-) -> tuple[Intent | None, str, object, list[dict] | None]:
+    trace: LatencyTrace | None = None,
+) -> tuple[Intent | None, str | None, object, list[dict] | None]:
     """Match intent; fetch context + user content; fire obvious tools immediately."""
     intent = match_intent(transcript)
+    mark_latency(trace, "intent_selected")
+    if trace is not None:
+        trace.set("intent_mode", intent.mode if intent else "model")
+        trace.set("intent_tool", intent.tool if intent else None)
+        trace.set("intent_family", intent.family if intent else None)
     if intent:
         print(f"{GREEN}[BRAIN] Intent {intent.mode}: {intent.note}{RESET}", flush=True)
     else:
         print(f"{GREEN}[BRAIN] Intent: full model{RESET}", flush=True)
 
     loop = asyncio.get_running_loop()
-    context_fut = loop.run_in_executor(None, _context_block)
-    user_fut = loop.run_in_executor(None, _user_content, transcript)
-
-    tool_task = None
     if intent and intent.mode == "execute":
         item = {
             "type": "tool_use",
@@ -681,16 +697,29 @@ async def _turn_setup(
             "name": intent.tool,
             "input": intent.inputs or {},
         }
-        tool_task = asyncio.create_task(_run_tool_calls([item], broadcast))
+        # A high-confidence action does not need live context or a screenshot.
+        # Execute immediately; callers can fetch context lazily only if the
+        # result unexpectedly needs model verbalization.
+        fast_results = await _run_tool_calls([item], broadcast, trace=trace)
+        return intent, None, transcript, fast_results
 
+    include_homelab = intent is None or intent.family == "homelab"
+    wait_for_pi = bool(intent and intent.family == "homelab")
+    context_fut = loop.run_in_executor(
+        None, lambda: _context_block(
+            include_homelab=include_homelab, wait_for_pi=wait_for_pi
+        )
+    )
+    user_fut = loop.run_in_executor(None, _user_content, transcript)
     context, user_content = await asyncio.gather(context_fut, user_fut)
-    fast_results = await tool_task if tool_task else None
-    return intent, context, user_content, fast_results
+    mark_latency(trace, "turn_context_ready")
+    return intent, context, user_content, None
 
 
 async def _run_tool_calls(
     tool_items: list[dict],
     broadcast: Callable[[dict], Awaitable[None]],
+    trace: LatencyTrace | None = None,
 ) -> list[dict]:
     """Execute all tool_use blocks in parallel on a thread pool."""
     loop = asyncio.get_running_loop()
@@ -709,8 +738,10 @@ async def _run_tool_calls(
         if tool_name == "look_at_screen":
             detail = "display"
         await broadcast({"event": "tool", "name": tool_name, "detail": detail})
+        mark_latency(trace, f"tool_{tool_name}_started")
         t0 = time.time()
         result = await loop.run_in_executor(_tool_pool, _execute_tool, tool_name, tool_inp)
+        mark_latency(trace, f"tool_{tool_name}_completed")
         elapsed = time.time() - t0
         if isinstance(result, dict) and result.get("ok") and result.get("data"):
             print(
@@ -738,6 +769,18 @@ async def _run_tool_calls(
     return list(await asyncio.gather(*[_one(item) for item in tool_items]))
 
 
+def _single_direct_tool_response(tool_items: list[dict], tool_results: list[dict]) -> str | None:
+    """Convert one completed, speech-ready tool result without another model step."""
+    if len(tool_items) != 1 or len(tool_results) != 1:
+        return None
+    item = tool_items[0]
+    return direct_response(
+        item.get("name"),
+        tool_results[0].get("content", ""),
+        item.get("input"),
+    )
+
+
 async def process(
     transcript: str,
     broadcast: Callable[[dict], Awaitable[None]],
@@ -747,14 +790,20 @@ async def process(
     Handles tool-use loop, broadcasts tool events to UI.
     Returns final text response.
     """
-    if not _configured(API_KEY):
-        return "My mind is... momentarily elsewhere. No AI Gateway key configured."
-
     transcript = strip_wake(transcript)
-    client = await _get_http()
     intent, context, user_content, fast_results = await _turn_setup(transcript, broadcast)
     if intent and intent.mode == "execute" and fast_results is not None:
+        result = fast_results[0].get("content", "") if fast_results else ""
+        direct = direct_response(intent.tool, result, intent.inputs)
+        if direct:
+            return direct
+        if context is None:
+            context = _context_block(include_homelab=intent.family == "homelab")
         user_content = _attach_fast_result(user_content, intent, fast_results)
+    if not _configured(API_KEY):
+        return "My mind is... momentarily elsewhere. No AI Gateway key configured."
+    client = await _get_http()
+    context = context or _context_block(include_homelab=False)
     system = _system_payload(context)
     tools, tool_choice, max_tokens = _tools_for_turn(intent, user_content)
     messages = [{"role": "user", "content": user_content}]
@@ -843,6 +892,7 @@ async def process_streaming(
     broadcast:   Callable[[dict], Awaitable[None]],
     on_sentence: Callable[[str], Awaitable[None]],
     history:     list[dict] | None = None,
+    trace:       LatencyTrace | None = None,
 ) -> tuple[str, bool]:
     """
     Stream the model's response token-by-token.
@@ -852,17 +902,32 @@ async def process_streaming(
     Returns (full_response_clean, needs_followup) where needs_followup is True
     when the model appended [FOLLOWUP] to indicate it expects a reply.
     """
+    # Context + obvious tools fire in parallel; Claude only thinks when needed.
+    transcript = strip_wake(transcript)
+    intent, context, user_content, fast_results = await _turn_setup(
+        transcript, broadcast, trace=trace
+    )
+    if intent and intent.mode == "execute" and fast_results is not None:
+        result = fast_results[0].get("content", "") if fast_results else ""
+        direct = direct_response(intent.tool, result, intent.inputs)
+        if direct:
+            mark_latency(trace, "deterministic_response_ready")
+            await on_sentence(direct)
+            if history is not None:
+                history.append({"role": "user", "content": transcript})
+                history.append({"role": "assistant", "content": direct})
+            return direct, False
+        loop = asyncio.get_running_loop()
+        context = await loop.run_in_executor(
+            None, lambda: _context_block(include_homelab=intent.family == "homelab")
+        )
+        user_content = _attach_fast_result(user_content, intent, fast_results)
     if not _configured(API_KEY):
         fallback = "My mind is... momentarily elsewhere. No AI Gateway key configured."
         await on_sentence(fallback)
         return fallback, False
-
-    # Context + obvious tools fire in parallel; Claude only thinks when needed.
-    transcript = strip_wake(transcript)
     client = await _get_http()
-    intent, context, user_content, fast_results = await _turn_setup(transcript, broadcast)
-    if intent and intent.mode == "execute" and fast_results is not None:
-        user_content = _attach_fast_result(user_content, intent, fast_results)
+    context = context or _context_block(include_homelab=False)
     system = _system_payload(context)
     tools, tool_choice, max_tokens = _tools_for_turn(intent, user_content)
     print(f"{GREEN}[BRAIN] Model {MODEL}{RESET}", flush=True)
@@ -898,6 +963,7 @@ async def process_streaming(
         speak_live = not tools
 
         try:
+            mark_latency(trace, f"model_step_{_step + 1}_started")
             async with client.stream("POST", API_URL, headers=_headers(), json=payload) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
@@ -930,6 +996,7 @@ async def process_streaming(
 
                         elif cur_block_type == "tool_use":
                             if not logged_ttft:
+                                mark_latency(trace, "model_first_token")
                                 print(
                                     f"{GREEN}[BRAIN] tool-call TTFT "
                                     f"{time.time() - t_req:.2f}s{RESET}",
@@ -953,6 +1020,7 @@ async def process_streaming(
 
                         if dtype == "text_delta":
                             if not logged_ttft:
+                                mark_latency(trace, "model_first_token")
                                 print(
                                     f"{GREEN}[BRAIN] TTFT {time.time() - t_req:.2f}s{RESET}",
                                     flush=True,
@@ -1030,7 +1098,19 @@ async def process_streaming(
             return clean, needs_followup
 
         tool_items = [item for item in clean_content if item["type"] == "tool_use"]
-        tool_results = await _run_tool_calls(tool_items, broadcast)
+        tool_results = await _run_tool_calls(tool_items, broadcast, trace=trace)
+        # Forced single-tool turns used the model only to extract arguments.
+        # Integrations already return trustworthy user-facing outcomes, so avoid
+        # paying for a second model round trip merely to paraphrase one result.
+        if intent and intent.mode == "force":
+            direct = _single_direct_tool_response(tool_items, tool_results)
+            if direct:
+                mark_latency(trace, "deterministic_response_ready")
+                await on_sentence(direct)
+                if history is not None:
+                    history.append({"role": "user", "content": transcript})
+                    history.append({"role": "assistant", "content": direct})
+                return direct, False
         messages.append({"role": "user", "content": tool_results})
 
     fallback = full_response.strip() or "The work is done. For now."

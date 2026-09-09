@@ -63,10 +63,7 @@ cp .env.example .env
 
 ## 5 — Getting each API key
 
-### Picovoice (wake word — free)
-1. Sign up at [console.picovoice.ai](https://console.picovoice.ai)
-2. Copy your **AccessKey** from the dashboard
-3. Set `PICOVOICE_ACCESS_KEY` in `.env`
+Wake-word detection uses OpenWakeWord locally and needs no API key.
 
 ### Vercel AI Gateway (proxies Claude)
 1. Go to [vercel.com/dashboard](https://vercel.com/dashboard) → **AI** → **AI Gateway**
@@ -168,12 +165,48 @@ The menu bar dot turns green while it listens. Try these commands:
 
 ## 8 — Testing integrations independently
 
+Run the non-mutating unit suite first:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+The following smoke tests contact real integrations and may create data or
+start playback:
+
 ```bash
 python main.py --test-spotify   # plays music, shows now_playing
 python main.py --test-gmail     # creates a test draft
 python main.py --test-notion    # searches + creates a test page
 python main.py --test-screen    # captures the display (needs Screen Recording)
+python main.py --test-pi-mcp    # lists Pi tools and calls get_status
 ```
+
+For STT benchmarking, collect representative 16 kHz WAV commands in one
+directory. Add a same-name `.txt` transcript beside each WAV to calculate word
+error rate, then run:
+
+```bash
+python scripts/benchmark-stt.py ./command-corpus
+```
+
+Configure `WHISPER_CPP_BIN` and `WHISPER_CPP_MODEL` to include whisper.cpp in
+the comparison. `STT_BACKEND=auto` uses it when available and safely falls back
+to the existing `base.en` backend.
+
+Completed turns record stage timings in `data/logs/latency.jsonl`. Summarize
+median and p95 latency by intent with:
+
+```bash
+python scripts/latency-report.py
+```
+
+The report separates post-speech delay into STT, response/tool work, and TTS.
+Local context questions and high-confidence commands skip the response model;
+small-talk turns omit tool schemas so their text can stream directly to speech.
+`VAD_FRAME_MS`, `VAD_SILENCE_SECS`, `TTS_PREROLL_MS`, and
+`SPOTIFY_DUCK_SETTLE_SECS` are latency/accuracy controls. Tune them against the
+same recorded command corpus and compare both p95 latency and word-error rate.
 
 ---
 
@@ -186,7 +219,7 @@ python main.py --test-screen    # captures the display (needs Screen Recording)
 | Gmail OAuth browser doesn't open | Run `python main.py` in a visible terminal (not a headless session) |
 | Fish Audio quota exceeded | Jarvis falls back to ElevenLabs, then `pyttsx3` system TTS |
 | Whisper is slow on first run | It downloads the `base` model (~140 MB) once — subsequent runs use the cache |
-| Wake word sensitivity too low | Replace `keywords=["jarvis"]` in `main.py` with a custom `.ppn` file from Picovoice Console |
+| Wake word sensitivity too low | Tune `WAKE_THRESHOLD` in `.env`; lower values are more sensitive but increase false activations |
 | UI doesn't appear | Ensure `npm install` was run in the project root; check terminal for Electron errors |
 
 ---

@@ -25,7 +25,7 @@ RESET = "\033[0m"
 
 PREFIX = "pi_"
 PROTOCOL = "2025-03-26"
-TOOL_TTL = 30
+TOOL_TTL = float(os.environ.get("PI_MCP_TOOL_TTL", "300"))
 INIT_TIMEOUT = 20.0
 CALL_TIMEOUT = 210.0
 
@@ -37,6 +37,7 @@ _tools: list[dict] = []
 _instructions = ""
 _listed_at = 0.0
 _last_error = ""
+_refresh_thread: threading.Thread | None = None
 
 
 def _url() -> str:
@@ -222,24 +223,42 @@ def refresh() -> list[dict]:
             return []
 
 
-def anthropic_tools() -> list[dict]:
+def anthropic_tools(*, wait_for_initial: bool = True) -> list[dict]:
+    """Return cached definitions immediately and refresh stale data off-path."""
     if not configured():
         return []
-    if _tools and (time.time() - _listed_at) < TOOL_TTL:
+    if _tools:
+        if (time.time() - _listed_at) >= TOOL_TTL:
+            _schedule_refresh()
         return list(_tools)
-    return refresh()
+    if wait_for_initial:
+        return refresh()
+    _schedule_refresh()
+    return []
+
+
+def _schedule_refresh() -> None:
+    global _refresh_thread
+    if _refresh_thread and _refresh_thread.is_alive():
+        return
+    _refresh_thread = threading.Thread(
+        target=refresh,
+        daemon=True,
+        name="jarvis-pi-mcp-refresh",
+    )
+    _refresh_thread.start()
 
 
 def tool_names() -> list[str]:
-    return [t["name"] for t in anthropic_tools()]
+    return [t["name"] for t in anthropic_tools(wait_for_initial=True)]
 
 
 def is_pi_tool(name: str) -> bool:
     return name.startswith(PREFIX)
 
 
-def live_instructions() -> str:
-    if not anthropic_tools():
+def live_instructions(*, wait_for_initial: bool = True) -> str:
+    if not anthropic_tools(wait_for_initial=wait_for_initial):
         return ""
     extra = _instructions or "Homelab tools control the Raspberry Pi (Radarr, status, attached monitor)."
     return (

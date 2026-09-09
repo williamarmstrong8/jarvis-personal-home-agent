@@ -5,8 +5,10 @@ ElevenLabs remains configured as a fallback.
 """
 
 import os
+import hashlib
 import queue
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,8 +18,9 @@ import wave
 import httpx
 import numpy as np
 import sounddevice as sd
-import whisper
 from dotenv import load_dotenv
+
+from .paths import DATA
 
 load_dotenv()
 
@@ -37,6 +40,18 @@ ELEVENLABS_MODEL    = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"
 
 PCM_RATE = 24000
 
+# ``auto`` selects whisper.cpp when both the CLI and model are configured,
+# otherwise it preserves the existing OpenAI Whisper implementation.
+STT_BACKEND = os.environ.get("STT_BACKEND", "auto").strip().lower()
+WHISPER_CPP_BIN = os.environ.get("WHISPER_CPP_BIN", "whisper-cli").strip()
+WHISPER_CPP_MODEL = os.environ.get("WHISPER_CPP_MODEL", "").strip()
+WHISPER_CPP_TIMEOUT = float(os.environ.get("WHISPER_CPP_TIMEOUT", "30"))
+
+OUTPUT_LATENCY = os.environ.get("AUDIO_OUTPUT_LATENCY", "low").strip().lower()
+TTS_PREROLL_MS = max(20, int(os.environ.get("TTS_PREROLL_MS", "40")))
+TTS_CACHE_ENABLED = os.environ.get("TTS_CACHE_ENABLED", "1").strip() != "0"
+TTS_CACHE_DIR = DATA / "tts_cache"
+
 CYAN   = "\033[96m"
 YELLOW = "\033[93m"
 RED    = "\033[91m"
@@ -46,28 +61,46 @@ RESET  = "\033[0m"
 _whisper_model = None
 
 
-def warmup():
-    """Pre-load Whisper model so first transcription is fast."""
+def _load_openai_model():
     global _whisper_model
-    print(f"{CYAN}[SPEECH] Loading Whisper base.en model…{RESET}", flush=True)
+    if _whisper_model is not None:
+        return _whisper_model
     import ssl
+    import whisper
     _orig = ssl._create_default_https_context
     ssl._create_default_https_context = ssl._create_unverified_context
     try:
-        # English-only is faster than multilingual `base` with no accuracy loss here.
         _whisper_model = whisper.load_model("base.en")
     finally:
         ssl._create_default_https_context = _orig
+    return _whisper_model
+
+
+def warmup():
+    """Pre-load the selected STT model and cloud TTS connection."""
+    backend = warmup_stt()
     _get_tts_client()  # warm keep-alive so the first spoken line isn't a TLS hit
     provider = "Fish Audio" if _use_fish() else ("ElevenLabs" if ELEVENLABS_API_KEY else "pyttsx3")
-    print(f"{CYAN}[SPEECH] Whisper ready · TTS={provider}{RESET}", flush=True)
+    print(f"{CYAN}[SPEECH] STT={backend} ready · TTS={provider}{RESET}", flush=True)
+    if TTS_CACHE_ENABLED:
+        threading.Thread(target=_precache_common_responses, daemon=True,
+                         name="jarvis-tts-precache").start()
+
+
+def warmup_stt(backend: str | None = None) -> str:
+    """Warm one STT backend without contacting a TTS provider."""
+    backend = backend or selected_stt_backend()
+    if backend == "whisper.cpp":
+        print(f"{CYAN}[SPEECH] whisper.cpp ready ({WHISPER_CPP_MODEL}){RESET}", flush=True)
+    else:
+        print(f"{CYAN}[SPEECH] Loading Whisper base.en model…{RESET}", flush=True)
+        # English-only is faster than multilingual `base` with no accuracy loss here.
+        _load_openai_model()
+    return backend
 
 
 def _get_model():
-    global _whisper_model
-    if _whisper_model is None:
-        warmup()
-    return _whisper_model
+    return _load_openai_model()
 
 
 def _wav_to_float32(wav_path: str) -> np.ndarray:
@@ -87,22 +120,67 @@ def _wav_to_float32(wav_path: str) -> np.ndarray:
     return audio
 
 
-def transcribe(wav_path: str) -> str:
+def _whisper_cpp_available() -> bool:
+    return bool(WHISPER_CPP_MODEL and os.path.isfile(WHISPER_CPP_MODEL)
+                and shutil.which(WHISPER_CPP_BIN))
+
+
+def selected_stt_backend() -> str:
+    if STT_BACKEND in ("whisper.cpp", "whisper_cpp", "whisper-cpp"):
+        return "whisper.cpp" if _whisper_cpp_available() else "openai-whisper"
+    if STT_BACKEND == "auto" and _whisper_cpp_available():
+        return "whisper.cpp"
+    return "openai-whisper"
+
+
+def _transcribe_whisper_cpp(wav_path: str) -> str:
+    proc = subprocess.run(
+        [
+            WHISPER_CPP_BIN,
+            "--model", WHISPER_CPP_MODEL,
+            "--file", wav_path,
+            "--language", "en",
+            "--no-timestamps",
+            "--no-prints",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=WHISPER_CPP_TIMEOUT,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _transcribe_openai_whisper(wav_path: str) -> str:
+    model  = _get_model()
+    result = model.transcribe(
+        _wav_to_float32(wav_path),
+        language="en",
+        fp16=False,
+        condition_on_previous_text=False,
+    )
+    return result.get("text", "").strip()
+
+
+def transcribe(wav_path: str, backend: str | None = None) -> str:
     """Transcribe a WAV file with Whisper. Returns the transcript string."""
     try:
-        t0     = time.time()
-        model  = _get_model()
-        result = model.transcribe(
-            _wav_to_float32(wav_path),
-            language="en",
-            fp16=False,
-            condition_on_previous_text=False,  # faster on short commands
-        )
-        text = result.get("text", "").strip()
-        print(f"{CYAN}[SPEECH] STT {time.time() - t0:.2f}s{RESET}", flush=True)
+        t0 = time.time()
+        chosen = backend or selected_stt_backend()
+        if chosen in ("whisper.cpp", "whisper_cpp", "whisper-cpp"):
+            text = _transcribe_whisper_cpp(wav_path)
+        else:
+            text = _transcribe_openai_whisper(wav_path)
+        print(f"{CYAN}[SPEECH] STT {time.time() - t0:.2f}s ({chosen}){RESET}", flush=True)
         return text
     except Exception as exc:
         print(f"{RED}[SPEECH] Whisper error: {exc}{RESET}", flush=True)
+        if backend is None and selected_stt_backend() == "whisper.cpp":
+            print(f"{YELLOW}[SPEECH] Falling back to OpenAI Whisper{RESET}", flush=True)
+            try:
+                return _transcribe_openai_whisper(wav_path)
+            except Exception as fallback_exc:
+                print(f"{RED}[SPEECH] Whisper fallback error: {fallback_exc}{RESET}", flush=True)
         return ""
 
 
@@ -120,7 +198,7 @@ _speaking_count = 0
 _speaking_lock = threading.Lock()
 
 _FADE_SAMPLES = 192          # 8 ms at 24 kHz — kills stream-edge clicks
-_PREROLL_BYTES = int(PCM_RATE * 2 * 0.12)  # 120 ms of int16 mono before first write
+_PREROLL_BYTES = int(PCM_RATE * 2 * TTS_PREROLL_MS / 1000)
 
 VOICE_SETTINGS = {
     "stability":         0.4,
@@ -199,23 +277,37 @@ class _OutputSession:
     Reopening PortAudio between sentences is what caused the mid-speech pop.
     """
 
-    def __init__(self):
+    def __init__(self, on_first_write=None, on_source_ready=None):
         self._stream = None
         self._first_write = True
+        self._on_first_write = on_first_write
+        self._on_source_ready = on_source_ready
+        self._reported_first_write = False
+        self._reported_source_ready = False
 
     def __enter__(self):
-        self._stream = sd.OutputStream(
-            samplerate=PCM_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=2048,
-            latency="high",
-        )
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=PCM_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=2048,
+                latency=OUTPUT_LATENCY,
+            )
+        except Exception:
+            # Some devices reject low-latency mode; retain a reliable fallback.
+            self._stream = sd.OutputStream(
+                samplerate=PCM_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=2048,
+                latency="high",
+            )
         self._stream.start()
-        self.write(np.zeros(int(PCM_RATE * 0.02), dtype=np.int16))
+        self.write(np.zeros(int(PCM_RATE * 0.02), dtype=np.int16), audible=False)
         return self
 
-    def write(self, samples: np.ndarray, fade_out: bool = False):
+    def write(self, samples: np.ndarray, fade_out: bool = False, audible: bool = True):
         if samples.size == 0 or self._stream is None:
             return
         audio = np.ascontiguousarray(samples)
@@ -226,6 +318,10 @@ class _OutputSession:
             audio = _fade_out(audio)
         try:
             self._stream.write(audio)
+            if audible and not self._reported_first_write:
+                self._reported_first_write = True
+                if self._on_first_write:
+                    self._on_first_write()
         except Exception as exc:
             print(f"{YELLOW}[SPEECH] Audio write failed: {exc}{RESET}", flush=True)
             self._abort()
@@ -294,6 +390,14 @@ class _OutputSession:
             return
         self.write(np.frombuffer(pcm, dtype=np.int16).copy(), fade_out=fade_out)
 
+    def source_ready(self):
+        """Report the first playable byte, before output preroll is buffered."""
+        if self._reported_source_ready:
+            return
+        self._reported_source_ready = True
+        if self._on_source_ready:
+            self._on_source_ready()
+
     def write_chunks(self, chunks, label: str) -> bool:
         leftover = b""
         preroll  = bytearray()
@@ -304,6 +408,8 @@ class _OutputSession:
             self.write_bytes(data, fade_out=fade_out)
 
         for chunk in chunks:
+            if chunk:
+                self.source_ready()
             leftover += chunk
             usable = len(leftover) - (len(leftover) % 2)
             if not usable:
@@ -343,6 +449,7 @@ def play_pcm(pcm: bytes, rate: int = PCM_RATE, session: _OutputSession | None = 
     if not pcm:
         return
     if session is not None:
+        session.source_ready()
         session.write_bytes(pcm)
         return
     with _SpeakingGuard():
@@ -598,22 +705,83 @@ def for_speech(text: str) -> str:
     return t.strip()
 
 
+def _tts_cache_path(text: str):
+    provider = "fish" if _use_fish() else "eleven"
+    identity = "|".join((
+        provider,
+        _fish_model() if provider == "fish" else ELEVENLABS_MODEL,
+        FISH_AUDIO_VOICE_ID if provider == "fish" else ELEVENLABS_VOICE_ID,
+        text,
+    ))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return TTS_CACHE_DIR / f"{digest}.pcm"
+
+
+def _load_tts_cache(text: str) -> bytes | None:
+    if not TTS_CACHE_ENABLED or len(text) > 180:
+        return None
+    try:
+        path = _tts_cache_path(text)
+        data = path.read_bytes()
+        return data or None
+    except OSError:
+        return None
+
+
+def _save_tts_cache(text: str, pcm: bytes) -> None:
+    if not TTS_CACHE_ENABLED or not pcm or len(text) > 180:
+        return
+    try:
+        TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _tts_cache_path(text)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(pcm)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _precache_common_responses() -> None:
+    for text in (
+        "Playback paused, sir.",
+        "Skipped to the next track, sir.",
+        "Resuming playback, sir.",
+        "Nothing is playing, sir.",
+        "No active Spotify device, sir.",
+        "I didn't catch that, sir.",
+    ):
+        if _load_tts_cache(text) is None:
+            synthesize_pcm(text)
+
+
 def synthesize_pcm(text: str) -> bytes | None:
     """Fetch a complete PCM buffer. Returns None on failure (caller may fall back)."""
     text = for_speech(text)
     if not text:
         return None
+    cached = _load_tts_cache(text)
+    if cached:
+        return cached
     if _use_fish():
         pcm = _fish_synthesize_pcm(text)
         if pcm:
+            _save_tts_cache(text, pcm)
             return pcm
-    return _eleven_synthesize_pcm(text)
+    pcm = _eleven_synthesize_pcm(text)
+    if pcm and not _use_fish():
+        _save_tts_cache(text, pcm)
+    return pcm
 
 
 def speak_streaming(text: str, session: _OutputSession | None = None):
     """Stream TTS to the speakers as bytes arrive — lowest time-to-first-audio."""
     text = for_speech(text)
     if not text:
+        return
+
+    cached = _load_tts_cache(text)
+    if cached:
+        play_pcm(cached, session=session)
         return
 
     if _use_fish():
@@ -672,9 +840,12 @@ class SpeechQueue:
     so gaps between sentences stay near zero.
     """
 
-    def __init__(self):
+    def __init__(self, on_first_audio=None, on_tts_start=None, on_tts_ready=None):
         self._texts: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._on_first_audio = on_first_audio
+        self._on_tts_start = on_tts_start
+        self._on_tts_ready = on_tts_ready
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -710,7 +881,12 @@ class SpeechQueue:
         try:
             with _SpeakingGuard():
                 with _play_lock:
-                    with _OutputSession() as session:
+                    with _OutputSession(
+                        on_first_write=self._on_first_audio,
+                        on_source_ready=self._on_tts_ready,
+                    ) as session:
+                        if self._on_tts_start:
+                            self._on_tts_start()
                         speak_streaming(first, session=session)
                         while True:
                             try:
