@@ -300,6 +300,14 @@ def add_movie(tmdb_id: int, quality_profile_id: int = 7) -> dict:
     existing = _api(RADARR, "/movie") or []
     for m in existing:
         if m.get("tmdbId") == tmdb_id:
+            _push_display({
+                "type": "card", "header": "RADARR",
+                "title": m.get("title") or "Movie",
+                "subtitle": "Already in library",
+                "poster": _poster(m.get("images")),
+                "lines": ["On disk: %s" % ("yes" if m.get("hasFile") else "no")],
+                "ttl_seconds": 90,
+            })
             return {
                 "movie_id": m["id"], "title": m["title"], "already_present": True,
                 "has_file": m.get("hasFile"),
@@ -314,6 +322,15 @@ def add_movie(tmdb_id: int, quality_profile_id: int = 7) -> dict:
     m["minimumAvailability"] = "released"
     m["addOptions"] = {"searchForMovie": False, "monitor": "movieOnly"}
     added = _api(RADARR, "/movie", "POST", m)
+    _push_display({
+        "type": "card", "header": "RADARR",
+        "title": added.get("title") or m.get("title") or "Movie",
+        "subtitle": "Added to library",
+        "overview": (m.get("overview") or "")[:400],
+        "poster": _poster(added.get("images") or m.get("images")),
+        "prompt": "Say grab if you want me to download it",
+        "ttl_seconds": 120,
+    })
     return {
         "movie_id": added.get("id"), "title": added.get("title"),
         "already_present": False, "path": added.get("path"),
@@ -351,7 +368,20 @@ def grab_release(movie_id: int, guid: str, indexer_id: int) -> dict:
     q = _api(RADARR, "/queue?pageSize=20") or {}
     for r in q.get("records", []):
         if r.get("movieId") == movie_id:
+            _push_display({
+                "type": "card", "header": "DOWNLOADING",
+                "title": r.get("title") or "Release",
+                "subtitle": r.get("status") or "queued",
+                "prompt": "Sent to the download client",
+                "ttl_seconds": 120,
+            })
             return {"queued": True, "title": r.get("title"), "status": r.get("status")}
+    _push_display({
+        "type": "card", "header": "DOWNLOADING",
+        "title": "Release queued",
+        "subtitle": "Radarr accepted it",
+        "ttl_seconds": 90,
+    })
     return {"queued": True, "note": "accepted by Radarr, not yet visible in the queue"}
 
 
@@ -403,6 +433,14 @@ def add_series(tvdb_id: int, quality_profile_id: int = 1) -> dict:
     s["monitored"] = True
     s["addOptions"] = {"searchForMissingEpisodes": False, "monitor": "all"}
     added = _api(SONARR, "/series", "POST", s)
+    _push_display({
+        "type": "card", "header": "SONARR",
+        "title": added.get("title") or s.get("title") or "Series",
+        "subtitle": "Added to library",
+        "overview": (s.get("overview") or "")[:400],
+        "poster": _poster(added.get("images") or s.get("images")),
+        "ttl_seconds": 120,
+    })
     return {
         "series_id": added.get("id"), "title": added.get("title"),
         "already_present": False, "path": added.get("path"),
@@ -589,32 +627,85 @@ def run_command(command: str, timeout_seconds: int = 20) -> dict:
         return {"error": str(exc)[:200]}
 
 
+def _display_token() -> str:
+    try:
+        return open("/etc/pi-mcp-token").read().strip()
+    except Exception:
+        return ""
+
+
+def _push_display(payload: dict) -> dict:
+    """Prefer the local display HTTP (sub-second). Fall back to override.json."""
+    tok = _display_token()
+    data = json.dumps(payload).encode()
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8766/",
+            data=data,
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + tok,
+                "Content-Type": "application/json",
+            },
+        )
+        urllib.request.urlopen(req, timeout=0.6)
+        return {"shown": True, "via": "http"}
+    except Exception:
+        pass
+    kind = (payload.get("type") or "card").lower()
+    if kind in ("video", "play"):
+        os.makedirs(RUNDIR, exist_ok=True)
+        tmp = os.path.join(RUNDIR, "command.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, os.path.join(RUNDIR, "command.json"))
+        return {"shown": True, "via": "command"}
+    os.makedirs(RUNDIR, exist_ok=True)
+    card = {
+        "header": payload.get("header") or "AGENT",
+        "title": payload.get("title") or "",
+        "subtitle": payload.get("subtitle") or "",
+        "overview": payload.get("overview") or "",
+        "poster": payload.get("poster") or "",
+        "lines": payload.get("lines") or [],
+        "prompt": payload.get("prompt") or "",
+    }
+    ttl = int(payload.get("ttl_seconds") or payload.get("ttl") or 180)
+    tmp = OVERRIDE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"expires_at": time.time() + max(5, min(ttl, 1800)), "payload": card}, f)
+    os.replace(tmp, OVERRIDE)
+    return {"shown": True, "via": "file"}
+
+
 @mcp.tool()
 def show_card(title: str, subtitle: str = "", overview: str = "", poster: str = "",
               lines: list | None = None, prompt: str = "",
               header: str = "AGENT", ttl_seconds: int = 180) -> dict:
-    """Display a full-screen card on the monitor attached to the Pi - poster image on
-    the left, metadata on the right, prompt along the bottom. Powers the display on and
-    takes priority over the Spotify now-playing screen until it expires or is cleared.
-    Entries in lines are rendered as key: value rows."""
-    os.makedirs(RUNDIR, exist_ok=True)
+    """Display a full-screen card on the HDMI monitor — poster left, metadata right.
+    Takes priority over Spotify now-playing until it expires or is cleared."""
     payload = {
+        "type": "card",
         "header": header, "title": title, "subtitle": subtitle,
         "overview": overview, "poster": poster, "lines": lines or [],
-        "prompt": prompt,
+        "prompt": prompt, "ttl_seconds": ttl_seconds,
     }
-    tmp = OVERRIDE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"expires_at": time.time() + max(5, min(ttl_seconds, 1800)),
-                   "payload": payload}, f)
-    os.replace(tmp, OVERRIDE)
-    return {"shown": True, "expires_in_seconds": ttl_seconds}
+    out = _push_display(payload)
+    out["expires_in_seconds"] = ttl_seconds
+    return out
+
+
+@mcp.tool()
+def play_media(path: str, title: str = "") -> dict:
+    """Play a local file from /data on the HDMI display via VLC."""
+    return _push_display({"type": "video", "path": path, "title": title or path})
 
 
 @mcp.tool()
 def clear_card() -> dict:
-    """Remove any card from the monitor, handing the display back to the Spotify
-    now-playing screen, or powering it off if nothing is playing."""
+    """Remove any card from the monitor, handing the display back to Spotify
+    now-playing, or powering it off if nothing is playing."""
+    _push_display({"type": "clear"})
     try:
         os.remove(OVERRIDE)
     except FileNotFoundError:

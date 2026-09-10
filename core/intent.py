@@ -46,7 +46,7 @@ FAMILY_TOOLS: dict[str, list[str]] = {
         "pi_plex_now_playing", "pi_list_requests", "pi_list_media_files",
         "pi_docker_restart", "pi_docker_logs", "pi_run_command",
         "pi_show_card", "pi_clear_card", "pi_now_playing",
-        "play_movie", "open_homelab",
+        "play_movie", "open_homelab", "control_pi_display",
     ],
     "screen":   [],   # screenshot is pre-attached; Claude just looks
 }
@@ -99,15 +99,22 @@ _NEGATE = re.compile(r"\b(?:don't|do not|never|not going to)\b", re.I)
 
 _NOT_MUSIC = re.compile(
     r"\b(video|movie|clip|trailer|game|voicemail|recording|podcast|"
-    r"season|episode|s\d{1,2}e\d{1,3}|jellyfin|plex)\b",
+    r"season|episode|s\d{1,2}e\d{1,3}|jellyfin|plex|"
+    r"raspberry\s+pi)\b",
     re.I,
 )
 
-_WATCH_EPISODE = re.compile(
-    r"\b(?:watch|play|put on|stream)\s+"
-    r"(?:season\s+(\w+)\s+episode\s+(\w+)\s+(?:of\s+)?(.+)"
-    r"|(.+?)\s+season\s+(\w+)\s+episode\s+(\w+)"
-    r"|(.+?)\s+s(\d{1,2})\s*e(\d{1,3}))",
+_WATCH_EPISODE_OF = re.compile(
+    r"season\s+(\w+)\s+episode\s+(\w+)\s+of\s+(.+)",
+    re.I,
+)
+_WATCH_EPISODE_SHOW = re.compile(
+    r"\b(?:watch|play|put on|stream)\s+(?:(?:this|that|the|a)\s+)*"
+    r"(?!season\b)(.+?)\s+season\s+(\w+)\s+episode\s+(\w+)",
+    re.I,
+)
+_WATCH_EPISODE_SE = re.compile(
+    r"\b(?:watch|play|put on|stream)\s+(.+?)\s+s(\d{1,2})\s*e(\d{1,3})\b",
     re.I,
 )
 
@@ -120,7 +127,15 @@ _OPEN_HOMELAB = re.compile(
 _WATCH_MOVIE = re.compile(
     r"^(?:watch)\s+(?:the )?(?:movie\s+)?(.+)$"
     r"|^(?:play|put on)\s+(?:the )?movie\s+(.+)$"
-    r"|^(?:play|put on)\s+(.+?)\s+on\s+(?:jellyfin|plex|(?:the |my )?pi)$",
+    r"|^(?:play|put on)\s+(.+?)\s+on\s+(?:jellyfin|plex|"
+    r"(?:the |my )?(?:raspberry\s+pi|raspi|pie|pi(?:'s)?(?:\s+display)?|"
+    r"tv|television|monitor|display|hdmi))$",
+    re.I,
+)
+
+_ON_DISPLAY = re.compile(
+    r"\bon (?:the |my )?(?:raspberry\s+pi|raspi|pie|pi(?:'s)?(?:\s+display)?|"
+    r"tv|television|monitor|display|hdmi)\b",
     re.I,
 )
 
@@ -197,6 +212,45 @@ _WEATHER_ELSEWHERE = re.compile(
 _PAUSE = re.compile(
     r"^(?:pause(?: it| that)?(?: (?:the )?(?:music|song|track|spotify|playback))?|"
     r"stop (?:the )?(?:music|song|track|playback)|stop playing)$",
+    re.I,
+)
+
+_PAUSE_MEDIA = re.compile(
+    r"\b(?:pause|unpause|resume)\b"
+    r"|\bstop (?:the |this |that )?(?:movie|show|episode|video|film|playback)\b",
+    re.I,
+)
+
+_STOP_MEDIA = re.compile(
+    r"\b(?:stop|quit|end|kill|turn off)\b.+\b(?:movie|show|episode|video|film)\b"
+    r"|\b(?:stop|quit|end) (?:playing|playback)\b",
+    re.I,
+)
+
+_RESUME_MEDIA = re.compile(
+    r"\b(?:resume|unpause|continue|keep playing|play again)\b",
+    re.I,
+)
+
+_PI_PLAYBACK = re.compile(
+    r"\b(?:movie|movies|show|episode|video|film|"
+    r"on (?:the |my )?(?:raspberry\s+pi|raspi|pie|pi(?:'s)?(?:\s+display)?|"
+    r"tv|television|monitor|hdmi))\b",
+    re.I,
+)
+
+_MUSIC_ONLY = re.compile(r"\b(?:music|song|track|spotify|playlist)\b", re.I)
+
+_VOL_SET = re.compile(
+    r"\b(?:(?:set|turn|put|make) )?(?:the )?(?:volume|sound)(?: (?:to|at))? (\d{1,3})\s*(?:percent|%)?",
+    re.I,
+)
+_VOL_UP = re.compile(
+    r"\b(?:volume up|turn (?:the )?(?:volume|sound|it) up|louder|raise (?:the )?volume)\b",
+    re.I,
+)
+_VOL_DOWN = re.compile(
+    r"\b(?:volume down|turn (?:the )?(?:volume|sound|it) down|quieter|softer|lower (?:the )?volume)\b",
     re.I,
 )
 
@@ -389,30 +443,42 @@ def _clean_title(title: str) -> str:
     t = title.strip(" .")
     t = re.sub(r"\s+for me$", "", t, flags=re.I)
     t = re.sub(r"^(?:the )?(?:show|series|tv show)\s+", "", t, flags=re.I)
-    t = re.sub(r"\s+on\s+(?:jellyfin|plex|(?:the |my )?pi)$", "", t, flags=re.I)
+    t = re.sub(
+        r"\s+on\s+(?:jellyfin|plex|"
+        r"(?:the |my )?(?:raspberry\s+pi|raspi|pie|pi(?:'s)?(?:\s+display)?|"
+        r"tv|television|monitor|display|hdmi))$",
+        "", t, flags=re.I,
+    )
     return t.strip(" .")
 
 
 def _episode_intent(t: str) -> Intent | None:
-    m = _WATCH_EPISODE.search(t)
-    if not m:
-        return None
-    g = m.groups()
-    if g[2]:
-        season, episode, title = g[0], g[1], g[2]
-    elif g[3]:
-        title, season, episode = g[3], g[4], g[5]
+    of = _WATCH_EPISODE_OF.search(t)
+    show = _WATCH_EPISODE_SHOW.search(t)
+    se = _WATCH_EPISODE_SE.search(t)
+    if of:
+        season, episode, title = of.group(1), of.group(2), of.group(3)
+    elif show:
+        title, season, episode = show.group(1), show.group(2), show.group(3)
+    elif se:
+        title, season, episode = se.group(1), se.group(2), se.group(3)
     else:
-        title, season, episode = g[6], g[7], g[8]
+        return None
     title = _clean_title(title or "")
+    title = re.sub(r"^(?:this|that|the|a|some)\s+", "", title, flags=re.I).strip()
+    if title.lower() in {"this", "that", "the", "a", "some", "it"}:
+        return None
     season_n = _to_int(season)
     episode_n = _to_int(episode)
     if not title or not season_n or not episode_n:
         return Intent("force", "play_movie", None, "homelab", "watch episode")
+    inputs = {"title": title, "season": season_n, "episode": episode_n}
+    if _ON_DISPLAY.search(t):
+        inputs["on_display"] = True
     return Intent(
         "execute",
         "play_movie",
-        {"title": title, "season": season_n, "episode": episode_n},
+        inputs,
         "homelab",
         f"watch {title} S{season_n:02d}E{episode_n:02d}",
     )
@@ -423,6 +489,13 @@ def _normalize(transcript: str) -> str:
     t = re.sub(r"[.?!,:;]+$", "", t)
     t = re.sub(r"\s+please$", "", t)
     t = re.sub(r"\s+for me$", "", t)
+    t = re.sub(r"\bmy pie\b", "my pi", t)
+    t = re.sub(r"\bthe pie\b", "the pi", t)
+    t = re.sub(r"\bon (the |my )?pie\b", r"on \1pi", t)
+    t = re.sub(r"\bpie display\b", "pi display", t)
+    # Whisper glues "Minds on" → "Mindson"
+    t = re.sub(r"(\w+)on\s+my\s+pi\b", r"\1 on my pi", t)
+    t = re.sub(r"(\w+)on\s+the\s+pi\b", r"\1 on the pi", t)
     for _ in range(3):
         nxt = _PREFIX.sub("", t).strip()
         if nxt == t:
@@ -430,6 +503,14 @@ def _normalize(transcript: str) -> str:
         t = nxt
     if _GARBLED_WAKE.match(t):
         t = _GARBLED_WAKE.sub("", t).strip()
+    # Whisper often prepends junk ("i drive this pause the movie…").
+    verb = re.search(
+        r"\b(?:pause|unpause|resume|stop playing|volume|"
+        r"turn (?:it |the volume )?(?:up|down)|louder|quieter)\b",
+        t,
+    )
+    if verb and verb.start() > 0 and not _NEGATE.search(t[:verb.start()]):
+        t = t[verb.start():]
     t = re.sub(r"\s+please$", "", t)
     t = re.sub(r"\s+for me$", "", t)
     return t.strip()
@@ -447,6 +528,60 @@ def _normalize_preserving_case(transcript: str) -> str:
             break
         text = cleaned
     return text.strip()
+
+
+def _wants_pi_playback(t: str) -> bool:
+    return bool(_ON_DISPLAY.search(t) or _PI_PLAYBACK.search(t))
+
+
+def _media_control_intent(t: str) -> Intent | None:
+    """Pause / resume / volume for HDMI VLC, including garbled 'pause the movie on my pie'."""
+    if not _wants_pi_playback(t):
+        return None
+    if _MUSIC_ONLY.search(t) and not re.search(
+        r"\b(?:movie|show|episode|video|film|pi|pie|tv|hdmi|display)\b", t
+    ):
+        return None
+    vol = _VOL_SET.search(t)
+    if vol:
+        n = int(next(g for g in vol.groups() if g))
+        n = max(0, min(100, n))
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "volume", "percent": n},
+            "homelab", f"pi volume {n}",
+        )
+    if _VOL_UP.search(t):
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "volume", "delta": 10},
+            "homelab", "pi volume up",
+        )
+    if _VOL_DOWN.search(t):
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "volume", "delta": -10},
+            "homelab", "pi volume down",
+        )
+    if _RESUME_MEDIA.search(t) and not re.search(r"\bpause\b", t):
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "resume"},
+            "homelab", "pi resume",
+        )
+    if re.search(r"\b(?:quit|kill|turn off)\b", t) and _STOP_MEDIA.search(t):
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "stop"},
+            "homelab", "pi stop",
+        )
+    if re.search(r"\bpause\b", t) or _STOP_MEDIA.search(t):
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "pause"},
+            "homelab", "pi pause",
+        )
+    return None
 
 
 def _families(text: str) -> list[str]:
@@ -511,13 +646,26 @@ def match_intent(transcript: str) -> Intent | None:
     if _CONTEXT_ONLY.match(t):
         return None
 
+    # ── Pi HDMI playback (before Spotify — "pause the movie on my pie") ───────
+    media = _media_control_intent(t)
+    if media:
+        return media
+
     # ── Spotify controls (no args) ────────────────────────────────────────────
     if _PAUSE.match(t):
-        return Intent("execute", "pause_spotify", {}, "spotify", "pause")
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "pause", "fallback_spotify": True},
+            "homelab", "pause",
+        )
     if _SKIP.match(t):
         return Intent("execute", "skip_spotify", {}, "spotify", "skip")
     if _RESUME.match(t):
-        return Intent("execute", "resume_spotify", {}, "spotify", "resume")
+        return Intent(
+            "execute", "control_pi_display",
+            {"action": "resume", "fallback_spotify": True},
+            "homelab", "resume",
+        )
     if _NOW_PLAYING.match(t):
         return Intent("execute", "get_currently_playing", {}, "spotify", "now playing")
 
@@ -550,8 +698,11 @@ def match_intent(transcript: str) -> Intent | None:
     if watch:
         title = _clean_title(next((g for g in watch.groups() if g), ""))
         if title:
+            inputs = {"title": title}
+            if _ON_DISPLAY.search(t):
+                inputs["on_display"] = True
             return Intent(
-                "execute", "play_movie", {"title": title}, "homelab", f"watch {title}",
+                "execute", "play_movie", inputs, "homelab", f"watch {title}",
             )
         return Intent("force", "play_movie", None, "homelab", "watch movie")
 

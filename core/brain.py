@@ -225,9 +225,9 @@ TOOLS = [
     {
         "name": "play_movie",
         "description": (
-            "Play a movie or TV episode from Jellyfin in the Mac browser. "
-            "Use for 'watch Inception', 'play season one episode one of Criminal Minds', "
-            "'play Avatar on jellyfin'. For TV pass season and episode numbers."
+            "Play a movie or TV episode from Jellyfin. Default: Mac browser. "
+            "Set on_display=true to play on the Pi HDMI monitor. "
+            "A confirmation card always appears on the Pi display."
         ),
         "input_schema": {
             "type": "object",
@@ -235,8 +235,43 @@ TOOLS = [
                 "title": {"type": "string", "description": "Movie or series title"},
                 "season": {"type": "integer", "description": "TV season number"},
                 "episode": {"type": "integer", "description": "TV episode number"},
+                "on_display": {
+                    "type": "boolean",
+                    "description": "Play on the Pi HDMI display instead of the Mac browser",
+                },
             },
             "required": ["title"],
+        },
+    },
+    {
+        "name": "control_pi_display",
+        "description": (
+            "Pause, resume, stop, or set volume for video playing on the Pi HDMI display. "
+            "Use this for 'pause the movie on my pi', 'turn it up on the tv'. "
+            "Do not use Plex, Jellyfin, or pi_run_command for HDMI playback control."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["pause", "resume", "stop", "volume"],
+                    "description": "pause, resume, stop, or volume",
+                },
+                "percent": {
+                    "type": "integer",
+                    "description": "Absolute volume 0–100 (volume action)",
+                },
+                "delta": {
+                    "type": "integer",
+                    "description": "Relative volume change, e.g. 10 or -10",
+                },
+                "fallback_spotify": {
+                    "type": "boolean",
+                    "description": "If nothing is on the Pi, pause/resume Spotify instead",
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -502,6 +537,15 @@ def _execute_tool(name: str, inputs: dict):
                 inputs.get("title") or "",
                 season=inputs.get("season"),
                 episode=inputs.get("episode"),
+                on_display=bool(inputs.get("on_display")),
+            )
+        elif name == "control_pi_display":
+            from integrations.pi_display import control_playback
+            return control_playback(
+                inputs.get("action") or "pause",
+                percent=inputs.get("percent"),
+                delta=inputs.get("delta"),
+                fallback_spotify=bool(inputs.get("fallback_spotify")),
             )
         elif name == "play_spotify":
             from integrations.spotify import play
@@ -634,7 +678,7 @@ def _tools_for_turn(
                 names = tool_names() or names
             except Exception:
                 pass
-            extra = [n for n in ("play_movie", "open_homelab") if n not in names]
+            extra = [n for n in ("play_movie", "open_homelab", "control_pi_display") if n not in names]
             if extra:
                 names = list(names) + extra
         names = [n for n in names if not (screen_attached and n == "look_at_screen")]

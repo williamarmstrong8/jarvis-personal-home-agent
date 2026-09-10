@@ -97,7 +97,7 @@ def _search(query: str, types: str, extra: dict | None = None, limit: int = 10) 
         "SearchTerm": query,
         "IncludeItemTypes": types,
         "Limit": str(max(1, min(limit, 25))),
-        "Fields": "ProductionYear,ParentIndexNumber,IndexNumber,SeriesName",
+        "Fields": "ProductionYear,ParentIndexNumber,IndexNumber,SeriesName,Path,Overview",
     }
     if extra:
         params.update(extra)
@@ -123,7 +123,7 @@ def _pick_named(query: str, items: list[dict], field: str = "Name") -> dict | No
 def _episode_for(series: dict, season: int, episode: int) -> dict | None:
     data = _get(
         f"/Shows/{series['Id']}/Episodes",
-        {"season": str(season), "Fields": "ProductionYear,ParentIndexNumber,IndexNumber,SeriesName"},
+        {"season": str(season), "Fields": "ProductionYear,ParentIndexNumber,IndexNumber,SeriesName,Path,Overview"},
     )
     items = data.get("Items") or []
     for it in items:
@@ -144,7 +144,14 @@ def _open_url(url: str) -> None:
     subprocess.run(["osascript", "-e", f'open location "{url}"'], check=False)
 
 
-def _open(item: dict) -> str:
+def _poster_url(item: dict) -> str:
+    item_id = item.get("Id") or ""
+    if not item_id or not _key():
+        return ""
+    return f"http://127.0.0.1:8096/Items/{item_id}/Images/Primary?fillHeight=800&api_key={_key()}"
+
+
+def _open(item: dict, on_display: bool = False) -> str:
     itype = item.get("Type") or ""
     name = item.get("Name") or "that title"
     if itype == "Episode":
@@ -152,16 +159,45 @@ def _open(item: dict) -> str:
         s = item.get("ParentIndexNumber")
         e = item.get("IndexNumber")
         label = f"{series} S{s:02d}E{e:02d} — {name}" if s and e else f"{series} — {name}"
+        subtitle = f"Season {s}  Episode {e}" if s and e else "Episode"
     else:
         year = item.get("ProductionYear")
         label = f"{name} ({year})" if year else name
+        subtitle = str(year) if year else "Movie"
+
+    try:
+        from integrations.pi_display import play_video, show_card
+        path = item.get("Path") or ""
+        ext = os.path.splitext(path)[1].lower()
+        if on_display and ext in {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".m2ts"}:
+            play_video(path, label)
+            print(f"{GREEN}[JELLYFIN] Pi display {label}{RESET}", flush=True)
+            return f"Playing {label} on the Pi display, sir."
+        show_card(
+            title=name if itype == "Episode" else (item.get("Name") or name),
+            subtitle=subtitle if itype != "Episode" else (item.get("SeriesName") or ""),
+            overview=item.get("Overview") or "",
+            poster=_poster_url(item),
+            lines=[f"Playing: {label}"],
+            prompt="Confirming on the Pi",
+            header="JARVIS",
+            ttl_seconds=90,
+        )
+    except Exception as exc:
+        print(f"{RED}[JELLYFIN] display push failed: {exc}{RESET}", flush=True)
+
     url = _details_url(item["Id"])
     _open_url(url)
     print(f"{GREEN}[JELLYFIN] Opened {label} → {url}{RESET}", flush=True)
+    if on_display and not item.get("Path"):
+        return (
+            f"I put {label} on the Pi card, sir, but couldn't find a local file to play. "
+            "Opening Jellyfin in the browser."
+        )
     return f"Opening {label} in Jellyfin, sir. Hit play in the browser if it doesn't start itself."
 
 
-def play_movie(title: str, season=None, episode=None) -> str:
+def play_movie(title: str, season=None, episode=None, on_display: bool = False) -> str:
     """Open a Jellyfin movie or TV episode in the Mac browser."""
     raw = (title or "").strip()
     if not raw and not (season and episode):
@@ -169,6 +205,7 @@ def play_movie(title: str, season=None, episode=None) -> str:
     if not configured():
         return "Jellyfin isn't configured on this Mac, sir. Set JELLYFIN_API_KEY in .env."
 
+    on_display = str(on_display).lower() in ("1", "true", "yes") or on_display is True
     query, parsed_s, parsed_e = _parse_title(raw)
     season = _num(season) or parsed_s
     episode = _num(episode) or parsed_e
@@ -186,24 +223,24 @@ def play_movie(title: str, season=None, episode=None) -> str:
                     f"I found {series.get('Name')}, but not season {season} "
                     f"episode {episode} in Jellyfin, sir."
                 )
-            return _open(item)
+            return _open(item, on_display)
 
         movies = _search(query, "Movie")
         movie = _pick_named(query, movies)
         if movie and (movie.get("Name") or "").lower() == query.lower():
-            return _open(movie)
+            return _open(movie, on_display)
 
         series = _pick_named(query, _search(query, "Series"))
         if series:
-            return _open(series)
+            return _open(series, on_display)
 
         if movie:
-            return _open(movie)
+            return _open(movie, on_display)
 
         eps = _search(query, "Episode")
         ep = _pick_named(query, eps, "SeriesName")
         if ep:
-            return _open(ep)
+            return _open(ep, on_display)
     except Exception as exc:
         print(f"{RED}[JELLYFIN] failed: {exc}{RESET}", flush=True)
         return f"Couldn't reach Jellyfin on the Pi, sir: {exc}"

@@ -497,6 +497,40 @@ def test_pi_mcp():
     ok(f"{len(tools)} tools: " + ", ".join(t["name"] for t in tools))
     print(call_tool("pi_get_status", {}))
 
+def test_display():
+    from integrations.pi_display import configured, health, post_wait, status
+    ok("=== Pi HDMI display test ===")
+    if not configured():
+        err("Set HOMELAB_HOST / JELLYFIN_URL and PI_MCP_TOKEN in .env")
+        return
+    h = health()
+    print("health:", h)
+    st = status()
+    print("status:", st)
+    if not st.get("ok") and h.get("ok") is not True:
+        err("Display HTTP is down — is spotify-display running on the Pi?")
+        return
+    sent = post_wait({
+        "type": "card",
+        "ttl_seconds": 90,
+        "header": "JARVIS",
+        "title": "Display test",
+        "subtitle": "HDMI check",
+        "overview": "If you can read this on the Pi, the display path is alive.",
+        "lines": ["mode: card", "source: --test-display"],
+        "prompt": "Look at the HDMI now",
+    })
+    print("card post:", sent)
+    time.sleep(0.4)
+    after = status()
+    print("status after card:", after)
+    if after.get("screen_on") and after.get("mode") == "card":
+        ok("Pi reports screen ON and mode=card — look at the HDMI")
+    elif after.get("ok"):
+        warn(f"Posted, but Pi reports mode={after.get('mode')} screen_on={after.get('screen_on')}")
+    else:
+        err(after.get("error") or "status check failed")
+
 
 # ── Main wake-word loop ────────────────────────────────────────────────────────
 
@@ -509,6 +543,7 @@ def main():
     parser.add_argument("--test-notion",  action="store_true")
     parser.add_argument("--test-screen",  action="store_true")
     parser.add_argument("--test-pi-mcp",  action="store_true")
+    parser.add_argument("--test-display", action="store_true")
     parser.add_argument(
         "--no-electron",
         action="store_true",
@@ -521,6 +556,7 @@ def main():
     if args.test_notion:  test_notion();  return
     if args.test_screen:  test_screen();  return
     if args.test_pi_mcp:  test_pi_mcp();  return
+    if args.test_display: test_display(); return
 
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)

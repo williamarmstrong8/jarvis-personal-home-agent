@@ -215,7 +215,7 @@ same recorded command corpus and compare both p95 latency and word-error rate.
 | Problem | Fix |
 |---|---|
 | `PyAudio` install fails | `brew install portaudio` first |
-| `No active Spotify device` | Open Spotify on your Mac/phone first |
+| `No Spotify player on this Mac` | Install the Spotify desktop app on **this** Mac. Jarvis plays here, not on another computer that was last using Spotify. Override the device name with `SPOTIFY_DEVICE_NAME` if it still picks wrong. |
 | Gmail OAuth browser doesn't open | Run `python main.py` in a visible terminal (not a headless session) |
 | Fish Audio quota exceeded | Jarvis falls back to ElevenLabs, then `pyttsx3` system TTS |
 | Whisper is slow on first run | It downloads the `base` model (~140 MB) once — subsequent runs use the cache |
