@@ -30,6 +30,14 @@ SCOPES = (
 )
 
 _sp: spotipy.Spotify | None = None
+_display_sync_lock = threading.Lock()
+_display_sync_generation = 0
+DISPLAY_SYNC_TIMEOUT = max(
+    1.0, float(os.environ.get("SPOTIFY_DISPLAY_SYNC_TIMEOUT", "4.0"))
+)
+DISPLAY_SYNC_INTERVAL = max(
+    0.12, float(os.environ.get("SPOTIFY_DISPLAY_SYNC_INTERVAL", "0.25"))
+)
 
 
 def _client() -> spotipy.Spotify:
@@ -62,16 +70,95 @@ def _mirror_display(item: dict | None, playing: bool = True, progress_ms: int = 
         pass
 
 
-def _mirror_soon() -> None:
+def _item_keys(item: dict | None) -> set[str]:
+    if not item:
+        return set()
+    return {str(v) for v in (item.get("id"), item.get("uri")) if v}
+
+
+def _next_display_sync() -> int:
+    global _display_sync_generation
+    with _display_sync_lock:
+        _display_sync_generation += 1
+        return _display_sync_generation
+
+
+def _display_sync_current(generation: int) -> bool:
+    with _display_sync_lock:
+        return generation == _display_sync_generation
+
+
+def _playback_matches_transition(
+    current: dict | None,
+    *,
+    expected_keys: set[str],
+    previous_keys: set[str],
+    expected_context_uri: str | None,
+    require_playing: bool | None,
+) -> bool:
+    item = (current or {}).get("item")
+    item_keys = _item_keys(item)
+    context_uri = ((current or {}).get("context") or {}).get("uri")
+    playing = bool(current and current.get("is_playing"))
+    return bool(
+        item is not None
+        and (require_playing is None or playing == require_playing)
+        and (not expected_keys or bool(expected_keys & item_keys))
+        and (not previous_keys or not bool(previous_keys & item_keys))
+        and (not expected_context_uri or context_uri == expected_context_uri)
+    )
+
+
+def _sync_display_after_transition(
+    *,
+    expected_item: dict | str | None = None,
+    previous_item: dict | None = None,
+    expected_context_uri: str | None = None,
+    require_playing: bool | None = True,
+) -> None:
+    """Poll briefly until Spotify exposes the post-command state.
+
+    Spotify Connect is eventually consistent. A single read at 250 ms often
+    returns the old song, which used to leave the Pi stale until its slow
+    fallback poll. Only the newest transition owns the display sync worker.
+    """
+    generation = _next_display_sync()
+    if isinstance(expected_item, dict):
+        expected_keys = _item_keys(expected_item)
+    elif expected_item:
+        expected_keys = {str(expected_item)}
+    else:
+        expected_keys = set()
+    previous_keys = _item_keys(previous_item)
+
     def _run():
-        time.sleep(0.25)
-        cur = playback_state()
-        _mirror_display(
-            (cur or {}).get("item"),
-            playing=bool(cur and cur.get("is_playing")),
-            progress_ms=(cur or {}).get("progress_ms") or 0,
-        )
-    threading.Thread(target=_run, daemon=True).start()
+        deadline = time.monotonic() + DISPLAY_SYNC_TIMEOUT
+        time.sleep(0.12)
+        while _display_sync_current(generation) and time.monotonic() < deadline:
+            cur = playback_state()
+            item = (cur or {}).get("item")
+            playing = bool(cur and cur.get("is_playing"))
+            state_matches = _playback_matches_transition(
+                cur,
+                expected_keys=expected_keys,
+                previous_keys=previous_keys,
+                expected_context_uri=expected_context_uri,
+                require_playing=require_playing,
+            )
+            if state_matches:
+                _mirror_display(
+                    item,
+                    playing=playing,
+                    progress_ms=(cur or {}).get("progress_ms") or 0,
+                )
+                return
+            time.sleep(DISPLAY_SYNC_INTERVAL)
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name="jarvis-spotify-display-sync",
+    ).start()
 
 
 def playback_state() -> dict | None:
@@ -91,6 +178,12 @@ def pause_for_voice() -> bool:
     if not device:
         return False
     _client().pause_playback(device_id=device)
+    _next_display_sync()
+    _mirror_display(
+        current.get("item"),
+        playing=False,
+        progress_ms=current.get("progress_ms") or 0,
+    )
     return True
 
 
@@ -298,13 +391,16 @@ def _pause_other_devices(sp, keep_id: str | None = None) -> None:
 
 
 def _start_playback(sp, device: str, **kwargs) -> None:
+    devices = _device_list(sp)
+    target_active = any(
+        d.get("id") == device and d.get("is_active") for d in devices
+    )
     _pause_other_devices(sp, keep_id=device)
-    time.sleep(0.2)
-    try:
-        sp.transfer_playback(device_id=device, force_play=False)
-        time.sleep(0.15)
-    except Exception:
-        pass
+    if not target_active:
+        try:
+            sp.transfer_playback(device_id=device, force_play=False)
+        except Exception:
+            pass
     sp.start_playback(device_id=device, **kwargs)
 
 
@@ -359,6 +455,7 @@ def set_volume(percent: int, device_id: str | None = None) -> None:
 def play(query: str, type: str = "track") -> str:
     try:
         sp = _client()
+        _next_display_sync()
 
         search_type = type if type in ("track", "artist", "playlist") else "track"
         item = _first_search_hit(sp, query, search_type)
@@ -404,13 +501,18 @@ def play(query: str, type: str = "track") -> str:
             name = item["name"]
             play_kwargs = {"context_uri": uri, "offset": {"position": 0}}
 
-        # AppleScript hits THIS Mac's app. Connect start_playback would otherwise
-        # follow whichever other computer was last active.
-        started = bool(local_uri and _play_uri_local(local_uri))
-        if started:
+        # Prefer one Connect start when this Mac is already registered. Starting
+        # first through AppleScript and then again through Connect caused an
+        # audible/display buffering reset on every command.
+        devices = _device_list(sp)
+        device = _pick_local_device_id(devices)
+        started = False
+        if not device:
+            started = bool(local_uri and _play_uri_local(local_uri))
+        if started and not device:
             _pause_other_devices(sp, keep_id=_pick_local_device_id(_device_list(sp)))
             device = _wait_for_local_device(sp, timeout=3)
-        else:
+        elif not device:
             device = _ensure_playback_device(sp)
         if device:
             try:
@@ -437,16 +539,16 @@ def play(query: str, type: str = "track") -> str:
             notify_playback_started()
         except Exception:
             pass
-        try:
-            from integrations.pi_display import push_spotify, show_card
-            if search_type == "track":
-                _mirror_display(item, True, 0)
-            elif search_type == "artist" and tracks:
-                _mirror_display(tracks[0], True, 0)
-            else:
-                show_card(name, subtitle="Playlist", header="SPOTIFY", prompt="Now playing")
-        except Exception:
-            pass
+        expected_item = item if search_type == "track" else (tracks[0] if tracks else None)
+        expected_context = item.get("uri") if search_type == "playlist" else None
+        if expected_item:
+            # Immediate optimistic screen, followed by authoritative progress.
+            _mirror_display(expected_item, True, 0)
+        _sync_display_after_transition(
+            expected_item=expected_item,
+            expected_context_uri=expected_context,
+            require_playing=True,
+        )
         return f"Playing {name}, sir."
 
     except Exception as exc:
@@ -468,8 +570,14 @@ def _first_search_hit(sp, query: str, search_type: str) -> dict | None:
 
 def pause() -> str:
     try:
+        _next_display_sync()
         current = playback_state()
         if current and not current.get("is_playing"):
+            _mirror_display(
+                current.get("item"),
+                playing=False,
+                progress_ms=current.get("progress_ms") or 0,
+            )
             return "Playback paused, sir."
         device = _active_device_id(current)
         if not device:
@@ -498,6 +606,7 @@ def _queue_has_next(sp) -> bool:
 
 def skip() -> str:
     try:
+        _next_display_sync()
         sp = _client()
         current = playback_state()
         device = _active_device_id(current)
@@ -513,14 +622,19 @@ def skip() -> str:
                 _start_playback(sp, device, uris=follow)
                 label = _track_label((current or {}).get("item"))
                 print(f"{GREEN}[SPOTIFY] Skip had no queue — continued from related tracks{RESET}", flush=True)
-                _mirror_soon()
+                _sync_display_after_transition(
+                    expected_item=follow[0],
+                    previous_item=(current or {}).get("item"),
+                )
                 return (
                     f"No next track in queue; started related songs"
                     f"{' after ' + label if label else ''}, sir."
                 )
 
         sp.next_track(device_id=device)
-        _mirror_soon()
+        _sync_display_after_transition(
+            previous_item=(current or {}).get("item"),
+        )
         return "Skipped to the next track, sir."
     except Exception as exc:
         print(f"{RED}[SPOTIFY] skip error: {exc}{RESET}", flush=True)
@@ -565,6 +679,7 @@ def is_playing() -> bool:
 def resume() -> str:
     """Resume Spotify playback."""
     try:
+        _next_display_sync()
         current = playback_state()
         device = _active_device_id(current)
         if not device:
@@ -574,17 +689,27 @@ def resume() -> str:
             return "Resuming playback, sir."
         try:
             _client().start_playback(device_id=device)
-            _mirror_display((current or {}).get("item"), True, (current or {}).get("progress_ms") or 0)
+            _sync_display_after_transition(
+                expected_item=(current or {}).get("item"),
+                require_playing=True,
+            )
             return "Resuming playback, sir."
         except Exception as exc:
             if "Restriction violated" in str(exc) and is_playing():
-                _mirror_soon()
+                _sync_display_after_transition(
+                    expected_item=(current or {}).get("item"),
+                    require_playing=True,
+                )
                 return "Resuming playback, sir."
             item = (current or {}).get("item") or {}
             uri = item.get("uri")
             if uri:
                 _client().start_playback(device_id=device, uris=[uri])
                 _mirror_display(item, True, 0)
+                _sync_display_after_transition(
+                    expected_item=item,
+                    require_playing=True,
+                )
                 return "Resuming playback, sir."
             raise exc
     except Exception as exc:

@@ -1,11 +1,34 @@
 import os
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
+# Keep deterministic routing/display tests runnable without optional Spotify
+# credentials or the production virtual environment.
+try:
+    import spotipy  # noqa: F401
+except ImportError:
+    spotipy = types.ModuleType("spotipy")
+    spotipy.Spotify = object
+    oauth2 = types.ModuleType("spotipy.oauth2")
+    oauth2.SpotifyOAuth = object
+    sys.modules["spotipy"] = spotipy
+    sys.modules["spotipy.oauth2"] = oauth2
+
+try:
+    import dotenv  # noqa: F401
+except ImportError:
+    dotenv = types.ModuleType("dotenv")
+    dotenv.load_dotenv = lambda *args, **kwargs: None
+    sys.modules["dotenv"] = dotenv
+
+from integrations import spotify as spotify_module
 from integrations.spotify import (
     _ensure_playback_device,
     _local_spotify_enabled,
     _name_matches,
+    _playback_matches_transition,
     _pick_device_id,
     _pick_local_device_id,
 )
@@ -96,6 +119,101 @@ class LocalLaunchTests(unittest.TestCase):
             self.assertEqual("mac-id", _ensure_playback_device(sp))
         launch.assert_called_once()
         wait.assert_called_once_with(sp)
+
+
+class DisplayTransitionTests(unittest.TestCase):
+    def test_rejects_stale_track_after_skip(self):
+        old = {"id": "old", "uri": "spotify:track:old"}
+        current = {"is_playing": True, "item": old}
+        self.assertFalse(
+            _playback_matches_transition(
+                current,
+                expected_keys=set(),
+                previous_keys={"old", "spotify:track:old"},
+                expected_context_uri=None,
+                require_playing=True,
+            )
+        )
+
+    def test_playlist_waits_for_its_playback_context(self):
+        current = {
+            "is_playing": True,
+            "item": {"id": "song"},
+            "context": {"uri": "spotify:playlist:wanted"},
+        }
+        self.assertTrue(
+            _playback_matches_transition(
+                current,
+                expected_keys=set(),
+                previous_keys=set(),
+                expected_context_uri="spotify:playlist:wanted",
+                require_playing=True,
+            )
+        )
+        current["context"]["uri"] = "spotify:playlist:old"
+        self.assertFalse(
+            _playback_matches_transition(
+                current,
+                expected_keys=set(),
+                previous_keys=set(),
+                expected_context_uri="spotify:playlist:wanted",
+                require_playing=True,
+            )
+        )
+
+    def test_playlist_goes_directly_to_playback_state(self):
+        playlist = {
+            "id": "mix",
+            "uri": "spotify:playlist:mix",
+            "name": "Daily Mix",
+        }
+        sp = object()
+        with (
+            patch("integrations.spotify._client", return_value=sp),
+            patch("integrations.spotify._first_search_hit", return_value=playlist),
+            patch("integrations.spotify._device_list", return_value=[]),
+            patch("integrations.spotify._pick_local_device_id", return_value="mac"),
+            patch("integrations.spotify._play_uri_local") as local_play,
+            patch("integrations.spotify._start_playback") as start,
+            patch("integrations.spotify._mirror_display") as mirror,
+            patch("integrations.spotify._sync_display_after_transition") as sync,
+        ):
+            result = spotify_module.play("Daily Mix", "playlist")
+
+        self.assertEqual("Playing Daily Mix, sir.", result)
+        local_play.assert_not_called()
+        start.assert_called_once_with(
+            sp,
+            "mac",
+            context_uri="spotify:playlist:mix",
+            offset={"position": 0},
+        )
+        mirror.assert_not_called()
+        self.assertEqual(
+            "spotify:playlist:mix",
+            sync.call_args.kwargs["expected_context_uri"],
+        )
+
+    def test_voice_duck_freezes_the_pi_timeline(self):
+        current = {
+            "is_playing": True,
+            "progress_ms": 42_000,
+            "device": {"id": "mac"},
+            "item": {"id": "song"},
+        }
+        client = types.SimpleNamespace(pause_playback=lambda **_kwargs: None)
+        with (
+            patch("integrations.spotify.playback_state", return_value=current),
+            patch("integrations.spotify._client", return_value=client),
+            patch("integrations.spotify._mirror_display") as mirror,
+        ):
+            self.assertTrue(spotify_module.pause_for_voice())
+
+        mirror.assert_called_once_with(
+            current["item"],
+            playing=False,
+            progress_ms=42_000,
+        )
 
 
 if __name__ == "__main__":

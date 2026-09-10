@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -23,6 +24,17 @@ RESET = "\033[0m"
 
 TIMEOUT = 0.8
 STATUS_TIMEOUT = 2.5
+_spotify_timestamp_lock = threading.Lock()
+_last_spotify_timestamp_ms = 0
+
+
+def _spotify_timestamp_ms() -> int:
+    """Strictly increasing sender timestamp for rejecting reordered HTTP posts."""
+    global _last_spotify_timestamp_ms
+    with _spotify_timestamp_lock:
+        value = max(time.time_ns() // 1_000_000, _last_spotify_timestamp_ms + 1)
+        _last_spotify_timestamp_ms = value
+        return value
 
 
 def _host() -> str:
@@ -161,9 +173,16 @@ def show_card(
 
 
 def push_spotify(item: dict | None, playing: bool = True, progress_ms: int = 0) -> None:
+    source_updated_at_ms = _spotify_timestamp_ms()
     if not item:
         if not playing:
-            post({"type": "spotify", "playing": False, "track": "", "artists": []})
+            post({
+                "type": "spotify",
+                "playing": False,
+                "track": "",
+                "artists": [],
+                "source_updated_at_ms": source_updated_at_ms,
+            })
         return
     album = item.get("album") or {}
     images = album.get("images") or []
@@ -181,6 +200,7 @@ def push_spotify(item: dict | None, playing: bool = True, progress_ms: int = 0) 
         "poster": poster,
         "progress_ms": int(progress_ms or 0),
         "duration_ms": int(item.get("duration_ms") or 0),
+        "source_updated_at_ms": source_updated_at_ms,
     })
 
 

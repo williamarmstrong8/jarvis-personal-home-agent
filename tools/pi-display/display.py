@@ -2,7 +2,8 @@
 """Pi HDMI display: Spotify now-playing, agent cards, local video.
 
 Mac Jarvis pushes state over HTTP (:8766) so this process never waits on
-the Spotify API for a track change. A slow poll is fallback only.
+the Spotify API for commanded track changes. A short adaptive poll keeps
+manual changes, buffering, and progress reconciled.
 """
 from __future__ import annotations
 
@@ -29,11 +30,10 @@ from PIL import Image, ImageDraw, ImageFont
 CONF = "/etc/spotify-display.json"
 FB = "/dev/fb0"
 BLANK = "/sys/class/graphics/fb0/blank"
-POLL_FALLBACK = 20.0
-PUSH_FRESH = 12.0
+POLL_PLAYING = max(0.75, float(os.environ.get("PI_DISPLAY_POLL_PLAYING", "2.0")))
+POLL_IDLE = max(2.0, float(os.environ.get("PI_DISPLAY_POLL_IDLE", "5.0")))
+PUSH_FRESH = max(0.25, float(os.environ.get("PI_DISPLAY_PUSH_FRESH", "0.75")))
 FPS = 15.0
-RESYNC_MS = 2000
-CORRECT = 0.12
 HTTP_PORT = int(os.environ.get("PI_DISPLAY_PORT", "8766"))
 TOKEN_FILE = os.environ.get("PI_DISPLAY_TOKEN_FILE", "/etc/pi-mcp-token")
 VLC_RC_HOST = os.environ.get("PI_DISPLAY_VLC_RC_HOST", "127.0.0.1")
@@ -131,13 +131,16 @@ S = {
     "full_pending": False,
     "last_good": 0.0,
     "last_push": 0.0,
+    "last_remote_push": 0.0,
+    "source_updated_at_ms": 0,
+    "render_generation": 0,
     "item": None,
     "last_video": None,
     "video_paused": False,
     "volume": 80,
 }
 LK = threading.Lock()
-_CARD = {"sig": None}
+_CARD = {"sig": None, "generation": 0}
 _VIDEO = {"proc": None}
 _TOKEN = ""
 
@@ -206,18 +209,24 @@ class Spotify:
 
 
 _art = {}
+_art_lock = threading.Lock()
 
 
 def art(url, w, h):
     k = (url, w, h)
-    if k not in _art:
-        raw = urllib.request.urlopen(
-            urllib.request.Request(url, headers={"User-Agent": "pi-dash/1.0"}),
-            timeout=3,
-        ).read()
+    with _art_lock:
+        cached = _art.get(k)
+    if cached is not None:
+        return cached
+    raw = urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "pi-dash/1.0"}),
+        timeout=3,
+    ).read()
+    image = Image.open(io.BytesIO(raw)).convert("RGB").resize((w, h), Image.LANCZOS)
+    with _art_lock:
         _art.clear()
-        _art[k] = Image.open(io.BytesIO(raw)).convert("RGB").resize((w, h), Image.LANCZOS)
-    return _art[k]
+        _art[k] = image
+    return image
 
 
 def mmss(ms):
@@ -225,7 +234,7 @@ def mmss(ms):
     return "%d:%02d" % (s // 60, s % 60)
 
 
-def base_frame(item, PA):
+def base_frame(item, PA, fetch_art=True):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     AH = 400
@@ -235,7 +244,7 @@ def base_frame(item, PA):
     imgs = (item.get("album") or {}).get("images") or []
     poster = item.get("poster") or (imgs[0]["url"] if imgs else "")
     ok = False
-    if poster:
+    if poster and fetch_art:
         try:
             img.paste(art(poster, AW, AH), (ax, ay))
             ok = True
@@ -400,7 +409,25 @@ def write_override(payload, ttl=180):
         raise
 
 
-def apply_spotify(item, playing=True, progress_ms=0, duration_ms=0, PA=0.75):
+def apply_spotify(
+    item,
+    playing=True,
+    progress_ms=0,
+    duration_ms=0,
+    PA=0.75,
+    source_updated_at_ms=0,
+):
+    source_updated_at_ms = int(source_updated_at_ms or 0)
+    with LK:
+        if (
+            source_updated_at_ms
+            and source_updated_at_ms <= S["source_updated_at_ms"]
+        ):
+            log("ignored reordered spotify push", source_updated_at_ms)
+            return
+        if source_updated_at_ms:
+            S["source_updated_at_ms"] = source_updated_at_ms
+        _CARD["generation"] += 1
     stop_video()
     try:
         os.remove(OVERRIDE)
@@ -409,7 +436,7 @@ def apply_spotify(item, playing=True, progress_ms=0, duration_ms=0, PA=0.75):
     dur = int(duration_ms or item.get("duration_ms") or 0)
     prog = int(progress_ms or 0)
     tid = item.get("id") or item.get("uri") or item.get("name")
-    now = time.time()
+    now = time.monotonic()
     with LK:
         new = tid != S["track"]
         S["mode"] = "spotify" if playing else "paused"
@@ -421,20 +448,45 @@ def apply_spotify(item, playing=True, progress_ms=0, duration_ms=0, PA=0.75):
         S["anchor_t"] = now
         S["last_good"] = now
         S["last_push"] = now
-        S["full_pending"] = new or S["base"] is None
+        if source_updated_at_ms:
+            S["last_remote_push"] = now
+        needs_render = new or S["base"] is None
+        if needs_render:
+            S["render_generation"] += 1
+            render_generation = S["render_generation"]
+            S["base"] = None
+            S["full_pending"] = False
+        else:
+            render_generation = S["render_generation"]
     publish(playing, item, prog, dur)
 
-    def _art():
+    def _commit_base(raw):
+        with LK:
+            if (
+                S["track"] != tid
+                or S["render_generation"] != render_generation
+                or S["mode"] not in ("spotify", "paused")
+            ):
+                return False
+            S["base"] = raw
+            S["full_pending"] = True
+            return True
+
+    def _render():
         try:
-            raw = to565(base_frame(item, PA))
-            with LK:
-                S["base"] = raw
-                S["full_pending"] = True
+            # Put fresh title/artist text on screen without waiting for the
+            # album-art network request, then replace it with the art frame.
+            if not _commit_base(to565(base_frame(item, PA, fetch_art=False))):
+                return
+            imgs = (item.get("album") or {}).get("images") or []
+            poster = item.get("poster") or (imgs[0].get("url") if imgs else "")
+            if poster:
+                _commit_base(to565(base_frame(item, PA, fetch_art=True)))
         except Exception as e:
             log("render error:", e)
 
-    if new or S.get("base") is None:
-        threading.Thread(target=_art, daemon=True).start()
+    if needs_render:
+        threading.Thread(target=_render, daemon=True, name="spotify-art").start()
     log("now playing:" if playing else "paused:", (item.get("name") or "")[:48])
 
 
@@ -443,12 +495,18 @@ def apply_card(payload, ttl=180):
     write_override(payload, ttl)
     with LK:
         S["mode"] = "card"
-        S["last_push"] = time.time()
+        S["last_push"] = time.monotonic()
+        _CARD["generation"] += 1
+        generation = _CARD["generation"]
     _CARD["sig"] = None
     screen(True)
     try:
-        blit_full(to565(render_card(payload)))
-        _CARD["sig"] = json.dumps(payload, sort_keys=True)
+        raw = to565(render_card(payload))
+        with LK:
+            if generation != _CARD["generation"] or S["mode"] != "card":
+                return
+            blit_full(raw)
+            _CARD["sig"] = json.dumps(payload, sort_keys=True)
         log("card:", str(payload.get("title"))[:44])
     except Exception as e:
         log("card error:", e)
@@ -464,7 +522,17 @@ def apply_card(payload, ttl=180):
                 timeout=3,
             ).read()
             im = Image.open(io.BytesIO(raw)).convert("RGB")
-            blit_full(to565(render_card(payload, im)))
+            current = read_override()
+            if (
+                current is None
+                or json.dumps(current, sort_keys=True) != json.dumps(payload, sort_keys=True)
+            ):
+                return
+            rendered = to565(render_card(payload, im))
+            with LK:
+                if generation != _CARD["generation"] or S["mode"] != "card":
+                    return
+                blit_full(rendered)
         except Exception as e:
             log("card poster error:", e)
 
@@ -674,7 +742,7 @@ def apply_control(action: str, body: dict | None = None) -> bool:
                         return False
                 with LK:
                     S["video_paused"] = True
-                    S["last_push"] = time.time()
+                    S["last_push"] = time.monotonic()
                 log("video paused")
             return True
         if action == "resume":
@@ -686,7 +754,7 @@ def apply_control(action: str, body: dict | None = None) -> bool:
                         return False
                 with LK:
                     S["video_paused"] = False
-                    S["last_push"] = time.time()
+                    S["last_push"] = time.monotonic()
                 log("video resumed")
             else:
                 _signal_vlc(signal.SIGCONT)
@@ -713,7 +781,7 @@ def apply_control(action: str, body: dict | None = None) -> bool:
                     return False
             with LK:
                 S["volume"] = vol
-                S["last_push"] = time.time()
+                S["last_push"] = time.monotonic()
             log("video volume", vol)
             return True
     except Exception as e:
@@ -731,9 +799,23 @@ def _fb_blank() -> str:
 
 def _status(full: bool = False) -> dict:
     proc = _VIDEO.get("proc")
+    now = time.monotonic()
     with LK:
         mode = S["mode"]
         last = dict(S.get("last_video") or {}) if S.get("last_video") else None
+        item = dict(S.get("item") or {}) if S.get("item") else None
+        playing = bool(S.get("playing"))
+        progress_ms = int(S.get("anchor_ms") or 0)
+        if playing:
+            progress_ms += int(max(0.0, now - S.get("anchor_t", now)) * 1000)
+        duration_ms = int(S.get("dur") or 0)
+        if duration_ms:
+            progress_ms = min(progress_ms, duration_ms)
+        remote_age = (
+            max(0.0, now - S["last_remote_push"])
+            if S.get("last_remote_push")
+            else None
+        )
     blank = _fb_blank()
     body = {
         "ok": True,
@@ -743,6 +825,11 @@ def _status(full: bool = False) -> dict:
         "video_alive": bool(proc and proc.poll() is None),
         "video_paused": bool(S.get("video_paused")),
         "volume": int(S.get("volume") or 80),
+        "spotify_playing": playing,
+        "spotify_track": (item or {}).get("name") or (item or {}).get("track") or "",
+        "spotify_progress_ms": progress_ms,
+        "spotify_duration_ms": duration_ms,
+        "last_remote_push_age_seconds": round(remote_age, 2) if remote_age is not None else None,
     }
     if last:
         if full:
@@ -774,7 +861,8 @@ def apply_video(path: str, title: str = ""):
     with LK:
         S["mode"] = "video"
         S["playing"] = False
-        S["last_push"] = time.time()
+        S["last_push"] = time.monotonic()
+        _CARD["generation"] += 1
         S["last_video"] = {
             "ok": None,
             "path": real,
@@ -946,6 +1034,7 @@ def handle_push(body: dict) -> bool:
             progress_ms=body.get("progress_ms") or 0,
             duration_ms=body.get("duration_ms") or item.get("duration_ms") or 0,
             PA=PA,
+            source_updated_at_ms=body.get("source_updated_at_ms") or 0,
         )
         return True
     if kind == "card":
@@ -967,6 +1056,7 @@ def handle_push(body: dict) -> bool:
             S["playing"] = False
             S["track"] = None
             S["base"] = None
+            _CARD["generation"] += 1
         return True
     return False
 
@@ -984,16 +1074,24 @@ def poller(sp, PA, GRACE):
     while True:
         consume_command_file()
         with LK:
-            fresh = (time.time() - S["last_push"]) < PUSH_FRESH
+            fresh_for = time.monotonic() - S["last_remote_push"]
+            fresh = fresh_for < PUSH_FRESH
             video = S["mode"] == "video"
-        if fresh or video:
+        if video:
             time.sleep(0.25)
             continue
-        state, item, p, dur, rtt = sp.now()
-        now = time.time()
+        if read_override() is not None:
+            time.sleep(0.25)
+            continue
+        if fresh:
+            time.sleep(min(0.25, max(0.05, PUSH_FRESH - fresh_for)))
+            continue
+        state, item, p, dur, _rtt = sp.now()
+        now = time.monotonic()
         if state == "playing" and item:
-            p_now = p + int(rtt * 500)
-            apply_spotify(item, True, p_now, dur, PA)
+            # Anchor at receipt. Adding half the HTTP RTT made the display lead
+            # real playback, especially while the Spotify client was buffering.
+            apply_spotify(item, True, p, dur, PA)
         elif state == "paused" and item:
             apply_spotify(item, False, p, dur, PA)
         elif state == "stopped":
@@ -1009,7 +1107,7 @@ def poller(sp, PA, GRACE):
             continue
         else:
             log("api hiccup (holding):", str(item)[:60])
-        time.sleep(POLL_FALLBACK)
+        time.sleep(POLL_PLAYING if state == "playing" else POLL_IDLE)
 
 
 def start_http():
@@ -1028,15 +1126,15 @@ def main():
     GRACE = float(conf.get("grace_seconds", 25))
     S["PA"] = PA
     os.makedirs(RUNDIR, exist_ok=True)
-    log("geometry %dx%d@%d  pixel_aspect=%.3f  fps=%.0f  push-http=:%d" % (
-        W, H, BPP, PA, FPS, HTTP_PORT,
+    log("geometry %dx%d@%d  pixel_aspect=%.3f  fps=%.0f  poll=%.1fs  push-http=:%d" % (
+        W, H, BPP, PA, FPS, POLL_PLAYING, HTTP_PORT,
     ))
     threading.Thread(target=start_http, daemon=True).start()
     sp = Spotify(conf)
     threading.Thread(target=poller, args=(sp, PA, GRACE), daemon=True).start()
     period = 1.0 / FPS
     while True:
-        t = time.time()
+        t = time.monotonic()
         consume_command_file()
         with LK:
             mode = S["mode"]
@@ -1086,7 +1184,7 @@ def main():
             with LK:
                 S["track"] = None
                 S["base"] = None
-        dt = time.time() - t
+        dt = time.monotonic() - t
         time.sleep(max(0.0, period - dt))
 
 

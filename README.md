@@ -182,6 +182,12 @@ python main.py --test-screen    # captures the display (needs Screen Recording)
 python main.py --test-pi-mcp    # lists Pi tools and calls get_status
 ```
 
+The Pi now-playing daemon lives at `tools/pi-display/display.py`; changes to
+that file must be deployed to the Pi and its `spotify-display` service
+restarted. While playing, it reconciles with Spotify every two seconds by
+default (`PI_DISPLAY_POLL_PLAYING`) while direct play/skip commands use faster
+short-lived synchronization from the Mac.
+
 For STT benchmarking, collect representative 16 kHz WAV commands in one
 directory. Add a same-name `.txt` transcript beside each WAV to calculate word
 error rate, then run:
