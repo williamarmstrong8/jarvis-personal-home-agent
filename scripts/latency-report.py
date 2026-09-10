@@ -43,7 +43,7 @@ def main() -> int:
 
     print(
         f"{'path':24} {'n':>5} {'total':>9} {'p95':>9} "
-        f"{'post-speech':>12} {'stt':>9} {'response':>10} {'tts':>9}"
+        f"{'post-speech':>12} {'stt':>9} {'stt-tail':>10} {'response':>10} {'tts':>9}"
     )
     for key, rows in sorted(groups.items()):
         totals = [r.get("marks_ms", {}).get("turn_complete") for r in rows]
@@ -54,11 +54,13 @@ def main() -> int:
         p95 = percentile(totals, .95)
         post_speech = median_delta(rows, "speech_ended", "first_audio")
         stt = median_delta(rows, "stt_started", "stt_completed")
+        stt_tail = median_delta(rows, "speech_ended", "stt_completed")
         response = median_delta(rows, "stt_completed", "response_ready")
         tts = median_delta(rows, "tts_started", "first_audio")
         print(
             f"{key[:24]:24} {len(totals):5d} {median:8.0f}ms {p95:8.0f}ms "
-            f"{post_speech:11.0f}ms {stt:8.0f}ms {response:9.0f}ms {tts:8.0f}ms"
+            f"{post_speech:11.0f}ms {stt:8.0f}ms {stt_tail:9.0f}ms "
+            f"{response:9.0f}ms {tts:8.0f}ms"
         )
     return 0
 

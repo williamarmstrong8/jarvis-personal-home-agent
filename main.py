@@ -104,7 +104,7 @@ def _vad_threshold() -> float:
 
 
 def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SECS,
-                         trace=None) -> bytes:
+                         trace=None, streaming_session=None) -> bytes:
     """
     Keep reading the already-open mic until silence or max duration.
     seed_frames (preroll) are prepended. Only their recent tail is considered
@@ -119,6 +119,9 @@ def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SE
     # complete command. Inspect only the recent tail, never the older wake-word
     # preroll, so music before the trigger does not count as user speech.
     speech_seen = any(_rms(frame) >= threshold for frame in frames[-12:])
+    if streaming_session:
+        for frame in frames:
+            streaming_session.push(frame, is_speech=_rms(frame) >= threshold)
 
     log(f"Recording… (adaptive threshold={threshold:.0f})")
     if trace and "recording_started" not in trace.marks:
@@ -127,6 +130,8 @@ def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SE
         data = stream.read(RECORD_CHUNK_SIZE, exception_on_overflow=False)
         frames.append(data)
         level = _rms(data)
+        if streaming_session:
+            streaming_session.push(data, is_speech=level >= threshold)
         if level < threshold:
             silent_chunks += 1
             recorded = len(frames) - len(seed_frames)
@@ -164,6 +169,46 @@ def fire_async(coro):
     if _async_loop is None:
         return
     asyncio.run_coroutine_threadsafe(coro, _async_loop)
+
+
+def _create_streaming_stt_session(trace):
+    """Start safe partial transcription; previews may prewarm but never execute."""
+    try:
+        from core.streaming_stt import create_streaming_transcriber
+
+        def _on_partial(text: str, stable: bool):
+            trace.set("partial_transcript_chars", len(text))
+            trace.set("partial_transcript_stable", stable)
+            try:
+                from core.brain import preview_route
+                route = preview_route(text)
+                trace.set("partial_intent_mode", route.get("mode"))
+                trace.set("partial_intent_family", route.get("family"))
+                trace.set("partial_intent_tool", route.get("tool"))
+            except Exception:
+                pass
+            try:
+                from core.ws_server import broadcast
+                fire_async(broadcast({
+                    "event": "partial_transcript",
+                    "text": text,
+                    "stable": stable,
+                }))
+            except Exception:
+                pass
+
+        session = create_streaming_transcriber(
+            sample_rate=SAMPLE_RATE,
+            endpoint_silence_secs=VAD_SILENCE_SECS,
+            on_partial=_on_partial,
+            trace=trace,
+        )
+        trace.set("streaming_stt_enabled", session is not None)
+        return session
+    except Exception as exc:
+        trace.set("streaming_stt_enabled", False)
+        warn(f"Streaming STT unavailable: {exc}")
+        return None
 
 
 def _stop_wake_mic(wake_stream):
@@ -228,8 +273,9 @@ SUIT_UP_TRIGGERS = {
 }
 
 
-def process_command(wav_path: str, is_followup: bool = False,
-                    history: list[dict] | None = None, trace=None):
+def process_command(wav_path: str | None, is_followup: bool = False,
+                    history: list[dict] | None = None, trace=None,
+                    prefetched_transcript: str | None = None):
     """Full pipeline: STT → brain → TTS. duck() is called by the wake loop before this."""
     from core.speech      import (
         transcribe, speak, SpeechQueue, for_speech, release_speaking,
@@ -248,11 +294,19 @@ def process_command(wav_path: str, is_followup: bool = False,
     trace.set("vad_frame_ms", VAD_FRAME_MS)
     trace.set("vad_silence_secs", VAD_SILENCE_SECS)
     t_pipe = time.time()
-    trace.mark("stt_started")
-    transcript = transcribe(wav_path)
+    if "stt_started" not in trace.marks:
+        trace.mark("stt_started")
+    transcript = prefetched_transcript
+    if transcript is None:
+        if not wav_path:
+            transcript = ""
+        else:
+            transcript = transcribe(wav_path)
     trace.mark("stt_completed")
+    trace.set("streaming_stt_used", prefetched_transcript is not None)
     trace.set("transcript_chars", len(transcript))
-    os.unlink(wav_path)
+    if wav_path:
+        os.unlink(wav_path)
 
     if not transcript.strip():
         warn("Empty transcript — skipping")
@@ -659,15 +713,21 @@ def main():
                 fire_async(broadcast({"event": "followup_listening"}))
                 if _ambient:
                     _ambient.notify_state("listening")
+                streaming_stt = _create_streaming_stt_session(trace)
                 pcm_data = record_until_silence(
-                    wake_stream, max_secs=8.0, trace=trace
+                    wake_stream, max_secs=8.0, trace=trace,
+                    streaming_session=streaming_stt,
                 )
-                wav_path = pcm_to_wav(pcm_data)
-                trace.mark("wav_ready")
+                _stop_wake_mic(wake_stream)
+                prefetched = streaming_stt.finish() if streaming_stt else None
+                wav_path = None if prefetched else pcm_to_wav(pcm_data)
+                if wav_path:
+                    trace.mark("wav_ready")
                 _run_command(
                     wake_stream, oww_model, preroll,
                     wav_path=wav_path, is_followup=True,
                     history=_conversation_history, trace=trace,
+                    prefetched_transcript=prefetched,
                 )
                 continue
 
@@ -738,15 +798,21 @@ def main():
                 )
 
                 log(f"Live capture active ({(time.time() - t_wake) * 1000:.0f}ms after wake)")
+                streaming_stt = _create_streaming_stt_session(trace)
                 pcm_data = record_until_silence(
-                    wake_stream, seed_frames=seed, trace=trace
+                    wake_stream, seed_frames=seed, trace=trace,
+                    streaming_session=streaming_stt,
                 )
-                wav_path = pcm_to_wav(pcm_data)
-                trace.mark("wav_ready")
+                _stop_wake_mic(wake_stream)
+                prefetched = streaming_stt.finish() if streaming_stt else None
+                wav_path = None if prefetched else pcm_to_wav(pcm_data)
+                if wav_path:
+                    trace.mark("wav_ready")
 
                 _run_command(
                     wake_stream, oww_model, preroll,
                     wav_path=wav_path, history=_conversation_history, trace=trace,
+                    prefetched_transcript=prefetched,
                 )
 
     except KeyboardInterrupt:

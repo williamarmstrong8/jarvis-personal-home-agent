@@ -689,6 +689,28 @@ def _tools_for_turn(
     return _cached_tools(), None, 1024
 
 
+def preview_route(transcript: str) -> dict:
+    """Resolve and prebuild a partial transcript's route without executing it."""
+    intent = match_intent(strip_wake(transcript))
+    if intent is None:
+        return {"mode": "model", "family": None, "tool": None}
+    # Build the likely payload now so imports and MCP definition-cache access
+    # happen while the user is still speaking. No integration is executed.
+    if intent.family == "homelab" and intent.mode == "filter":
+        try:
+            from integrations.pi_mcp import anthropic_tools
+            anthropic_tools(wait_for_initial=False)
+        except Exception:
+            pass
+    else:
+        _tools_for_turn(intent, transcript)
+    return {
+        "mode": intent.mode,
+        "family": intent.family,
+        "tool": intent.tool,
+    }
+
+
 def _attach_fast_result(user_content, intent: Intent, tool_results: list[dict]):
     result = tool_results[0].get("content", "") if tool_results else ""
     if isinstance(result, list):
@@ -728,6 +750,13 @@ async def _turn_setup(
         trace.set("intent_mode", intent.mode if intent else "model")
         trace.set("intent_tool", intent.tool if intent else None)
         trace.set("intent_family", intent.family if intent else None)
+        if "partial_intent_mode" in trace.fields:
+            trace.set(
+                "partial_intent_matched",
+                trace.fields.get("partial_intent_mode") == (intent.mode if intent else "model")
+                and trace.fields.get("partial_intent_family") == (intent.family if intent else None)
+                and trace.fields.get("partial_intent_tool") == (intent.tool if intent else None),
+            )
     if intent:
         print(f"{GREEN}[BRAIN] Intent {intent.mode}: {intent.note}{RESET}", flush=True)
     else:

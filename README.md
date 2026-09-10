@@ -194,6 +194,15 @@ Configure `WHISPER_CPP_BIN` and `WHISPER_CPP_MODEL` to include whisper.cpp in
 the comparison. `STT_BACKEND=auto` uses it when available and safely falls back
 to the existing `base.en` backend.
 
+With whisper.cpp selected, `STT_STREAMING=auto` transcribes rolling audio
+snapshots while the user speaks. Partial text updates the UI and prebuilds the
+likely route, but never executes a command. During endpoint silence Jarvis
+starts final candidates early and reuses one only when the snapshot contains
+the last frame classified as speech plus nearly all tail audio. Set
+`STT_STREAMING=off` to compare against the full-file path. `STT_STREAMING=on`
+also permits rolling Python Whisper for experiments, but `auto` avoids it
+because repeated CPU inference can be slower.
+
 Completed turns record stage timings in `data/logs/latency.jsonl`. Summarize
 median and p95 latency by intent with:
 

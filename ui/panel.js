@@ -40,6 +40,9 @@ function handleEvent(data) {
     case "transcript":
       if (data.text) heardEl.textContent = data.text;
       break;
+    case "partial_transcript":
+      if (data.text) heardEl.textContent = data.text;
+      break;
     case "spoke":
       if (data.text) replyEl.textContent = data.text;
       break;

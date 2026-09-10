@@ -14,6 +14,7 @@ from typing import Any
 
 DIRECT_RESPONSE_TOOLS = {
     "get_context_value",
+    "control_pi_display",
     "open_homelab",
     "play_movie",
     "play_spotify",

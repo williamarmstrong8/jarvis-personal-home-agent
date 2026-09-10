@@ -53,7 +53,7 @@ class BrainFastPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Playback paused, sir.", result)
         self.assertFalse(followup)
         self.assertEqual(["Playback paused, sir."], spoken)
-        self.assertEqual("pause_spotify", events[0]["name"])
+        self.assertEqual("control_pi_display", events[0]["name"])
 
     async def test_context_question_needs_no_gateway(self):
         events = []
@@ -98,6 +98,14 @@ class BrainFastPathTests(unittest.IsolatedAsyncioTestCase):
             "Done, sir. 'Design review' added to your calendar.",
             direct,
         )
+
+    def test_partial_route_preview_does_not_execute(self):
+        with patch.object(
+            brain, "_execute_tool", side_effect=AssertionError("tool executed")
+        ):
+            route = brain.preview_route("pause the movie on the pi")
+        self.assertEqual("execute", route["mode"])
+        self.assertEqual("homelab", route["family"])
 
 
 if __name__ == "__main__":

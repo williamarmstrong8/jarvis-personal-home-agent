@@ -15,7 +15,10 @@ class IntentRoutingTests(unittest.TestCase):
         return intent
 
     def test_fast_spotify_controls(self):
-        self.assert_intent("Hey Jarvis, pause the music", "execute", "pause_spotify")
+        pause = self.assert_intent(
+            "Hey Jarvis, pause the music", "execute", "control_pi_display"
+        )
+        self.assertTrue(pause.inputs["fallback_spotify"])
         self.assert_intent("skip this track", "execute", "skip_spotify")
         self.assert_intent("what's playing?", "execute", "get_currently_playing")
 
