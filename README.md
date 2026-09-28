@@ -135,7 +135,7 @@ python main.py
 npm run install:app
 ```
 
-That builds `Jarvis.app` and copies it to `/Applications`. It does **not** add a login item and does **not** sit in the Dock — look for a colored dot in the menu bar (next to Wi‑Fi). Click it for last heard / reply; right-click → Quit Jarvis.
+That builds `Jarvis.app` and copies it to `/Applications`. It does **not** add a login item and does **not** sit in the Dock or the menu bar — Jarvis lives in the camera notch (see *The notch island* below). Right-click the notch → Quit Jarvis.
 
 First launch: grant **Microphone** (and Screen Recording if you use that). If macOS blocks the app, right-click → Open.
 
@@ -145,9 +145,21 @@ Do not run `python main.py` and the .app at the same time — they fight over th
 
 ---
 
-## 7 — Say "Hey Jarvis"
+## 7 — The notch island
 
-The menu bar dot turns green while it listens. Try these commands:
+Jarvis grows out of the MacBook's camera notch like a Dynamic Island:
+
+- **Idle** — invisible; it's exactly the size and colour of the notch.
+- **Listening** — wings slide out either side of the camera: the orb on the left, a live mic waveform on the right. As soon as you start talking the island drops down and your words appear **as you say them**, fading in word by word.
+- **Working** — every tool the model calls gets a row (Spotify, Mail, Calendar, Homelab…) with a spinner that ticks to ✓ when it lands, plus a short result summary.
+- **Replying** — Jarvis' words stream into the grey bubble as they're generated, in sync with his voice. The ■ button stops him mid-sentence.
+- **Cards** — music gets a full Spotify card (artwork, scrubber, shuffle / previous / play-pause / next / repeat — all live controls). Movies get a playback card.
+
+Hover the notch to reopen the last conversation, click the field to **type** a request instead of speaking, or press **⌥ Space** (override with `JARVIS_HOTKEY`) to talk without the wake word. The notch width is detected from the menu-bar height; set `JARVIS_NOTCH_WIDTH` if yours lines up a few points off. On displays without a notch the island draws its own and hides when idle.
+
+## 8 — Say "Hey Jarvis"
+
+There is no keyword router: every request goes straight to the model (`JARVIS_MODEL`, Gemma 4 by default) with the full tool belt, and it decides what to call — several tools at once when the request has several parts. Try these commands:
 
 | Command | What happens |
 |---|---|
@@ -160,10 +172,12 @@ The menu bar dot turns green while it listens. Try these commands:
 | "Hey Jarvis, create a Notion page called Project Ideas with a brief outline" | Creates Notion page |
 | "Hey Jarvis, search Notion for meeting notes" | Returns top matching pages |
 | "Hey Jarvis, what time is it in Tokyo?" | Conversational answer |
+| "Hey Jarvis, put on some Radiohead and text Alex I'm running late" | Both tools fire in parallel, one spoken summary |
+| "Hey Jarvis, suit up" | Runs the startup sequence (the model calls the `suit_up` tool) |
 
 ---
 
-## 8 — Testing integrations independently
+## 9 — Testing integrations independently
 
 Run the non-mutating unit suite first:
 
@@ -200,25 +214,24 @@ Configure `WHISPER_CPP_BIN` and `WHISPER_CPP_MODEL` to include whisper.cpp in
 the comparison. `STT_BACKEND=auto` uses it when available and safely falls back
 to the existing `base.en` backend.
 
-With whisper.cpp selected, `STT_STREAMING=auto` transcribes rolling audio
-snapshots while the user speaks. Partial text updates the UI and prebuilds the
-likely route, but never executes a command. During endpoint silence Jarvis
-starts final candidates early and reuses one only when the snapshot contains
-the last frame classified as speech plus nearly all tail audio. Set
-`STT_STREAMING=off` to compare against the full-file path. `STT_STREAMING=on`
-also permits rolling Python Whisper for experiments, but `auto` avoids it
-because repeated CPU inference can be slower.
+`STT_STREAMING=auto` transcribes rolling audio snapshots while you speak, on
+both whisper.cpp and Python Whisper, so the notch shows your words live.
+Partial text updates the UI and prewarms the model request (tool schemas and
+context), but never executes a command. During endpoint silence Jarvis starts
+final candidates early and reuses one only when the snapshot contains the last
+frame classified as speech plus nearly all tail audio. whisper.cpp keeps the
+partials cheapest; set `STT_STREAMING=off` to disable live transcription.
 
 Completed turns record stage timings in `data/logs/latency.jsonl`. Summarize
-median and p95 latency by intent with:
+median and p95 latency with:
 
 ```bash
 python scripts/latency-report.py
 ```
 
 The report separates post-speech delay into STT, response/tool work, and TTS.
-Local context questions and high-confidence commands skip the response model;
-small-talk turns omit tool schemas so their text can stream directly to speech.
+The model may speak a short line while its tools run, so first audio usually
+lands before the tool finishes.
 `VAD_FRAME_MS`, `VAD_SILENCE_SECS`, `TTS_PREROLL_MS`, and
 `SPOTIFY_DUCK_SETTLE_SECS` are latency/accuracy controls. Tune them against the
 same recorded command corpus and compare both p95 latency and word-error rate.
@@ -236,6 +249,8 @@ same recorded command corpus and compare both p95 latency and word-error rate.
 | Whisper is slow on first run | It downloads the `base` model (~140 MB) once — subsequent runs use the cache |
 | Wake word sensitivity too low | Tune `WAKE_THRESHOLD` in `.env`; lower values are more sensitive but increase false activations |
 | UI doesn't appear | Ensure `npm install` was run in the project root; check terminal for Electron errors |
+| Island is offset from the notch | Set `JARVIS_NOTCH_WIDTH` (points) in your environment and relaunch |
+| ⌥ Space does nothing | Another app owns the shortcut — set `JARVIS_HOTKEY` (Electron accelerator syntax, e.g. `Control+Alt+J`) |
 
 ---
 
@@ -244,9 +259,8 @@ same recorded command corpus and compare both p95 latency and word-error rate.
 ```
 Jarvis 2.0/
 ├── main.py                 # Entry point — wake word loop
-├── core/                   # Brain, speech, intent, presence
-│   ├── brain.py
-│   ├── intent.py
+├── core/                   # Brain, speech, presence
+│   ├── brain.py            # Model-routed tool loop (no regex router)
 │   ├── speech.py
 │   ├── context.py
 │   ├── ambient.py
@@ -266,12 +280,12 @@ Jarvis 2.0/
 │   ├── homelab_web.py
 │   ├── pi_mcp.py
 │   └── screen.py
-├── ui/                     # Electron HUD
-│   ├── main.js
+├── ui/                     # Electron notch island
+│   ├── main.js             # Transparent window pinned to the camera notch
 │   ├── preload.js
-│   ├── index.html
-│   ├── style.css
-│   └── renderer.js
+│   ├── island.html
+│   ├── island.css
+│   └── island.js
 ├── skills/                 # Drop-in SKILL.md agents
 ├── tools/                  # Podcast pipeline, TTS, data sources, Pi MCP
 │   ├── podcast/

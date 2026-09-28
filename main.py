@@ -10,6 +10,7 @@ import base64
 import collections
 import logging
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -126,10 +127,21 @@ def record_until_silence(stream, seed_frames=(), max_secs: float = MAX_RECORD_SE
     log(f"Recording… (adaptive threshold={threshold:.0f})")
     if trace and "recording_started" not in trace.marks:
         trace.mark("recording_started")
+    # Mic level for the notch waveform, ~11 updates/s at 30 ms frames.
+    level_every = max(1, int(round(0.09 * SAMPLE_RATE / RECORD_CHUNK_SIZE)))
+    try:
+        from core.ws_server import broadcast as _ws_broadcast
+    except Exception:
+        _ws_broadcast = None
     while len(frames) - len(seed_frames) < max_chunks:
         data = stream.read(RECORD_CHUNK_SIZE, exception_on_overflow=False)
         frames.append(data)
         level = _rms(data)
+        if _ws_broadcast and len(frames) % level_every == 0:
+            fire_async(_ws_broadcast({
+                "event": "level",
+                "value": round(min(1.0, level / max(threshold * 4.0, 1.0)), 3),
+            }))
         if streaming_session:
             streaming_session.push(data, is_speech=level >= threshold)
         if level < threshold:
@@ -176,17 +188,20 @@ def _create_streaming_stt_session(trace):
     try:
         from core.streaming_stt import create_streaming_transcriber
 
+        prewarmed = False
+
         def _on_partial(text: str, stable: bool):
+            nonlocal prewarmed
             trace.set("partial_transcript_chars", len(text))
             trace.set("partial_transcript_stable", stable)
-            try:
-                from core.brain import preview_route
-                route = preview_route(text)
-                trace.set("partial_intent_mode", route.get("mode"))
-                trace.set("partial_intent_family", route.get("family"))
-                trace.set("partial_intent_tool", route.get("tool"))
-            except Exception:
-                pass
+            if not prewarmed:
+                # Tool payload + context ready before the user stops talking.
+                prewarmed = True
+                try:
+                    from core.brain import prewarm
+                    prewarm()
+                except Exception:
+                    pass
             try:
                 from core.ws_server import broadcast
                 fire_async(broadcast({
@@ -267,21 +282,16 @@ def _silence_spotify_while_capturing(stream) -> tuple[bool, list[bytes]]:
     return bool(box["silenced"]), captured
 
 
-SUIT_UP_TRIGGERS = {
-    "suit up", "initialize", "run startup sequence",
-    "boot sequence", "power up",
-}
-
-
 def process_command(wav_path: str | None, is_followup: bool = False,
                     history: list[dict] | None = None, trace=None,
-                    prefetched_transcript: str | None = None):
+                    prefetched_transcript: str | None = None,
+                    source: str = "voice"):
     """Full pipeline: STT → brain → TTS. duck() is called by the wake loop before this."""
     from core.speech      import (
         transcribe, speak, SpeechQueue, for_speech, release_speaking,
         selected_stt_backend,
     )
-    from core.brain       import process_streaming
+    from core.brain       import consume_suit_up_request, process_streaming
     from core.ws_server   import broadcast
     from core.context     import get_context_block
     from core.audio_duck  import restore
@@ -317,23 +327,9 @@ def process_command(wav_path: str | None, is_followup: bool = False,
         return
 
     log(f"Transcript: {transcript}")
-    run_async(broadcast({"event": "transcript", "text": transcript}))
+    run_async(broadcast({"event": "transcript", "text": transcript, "source": source}))
 
-    # ── Suit-up trigger check ─────────────────────────────────────────────────
-    normalized = transcript.lower().strip().rstrip(".,!?")
-    if normalized in SUIT_UP_TRIGGERS:
-        from core.suit_up import run_suit_up_sequence
-        log("Suit-up sequence triggered!")
-        restore()
-        if _ambient:
-            _ambient.notify_state("processing")
-        run_async(run_suit_up_sequence(broadcast, speak, get_context_block))
-        if _ambient:
-            _ambient.notify_state("standby")
-        trace.finish("suit_up")
-        return
-
-    # ── Normal pipeline ───────────────────────────────────────────────────────
+    # ── Model pipeline (the model routes everything, suit-up included) ────────
     if _ambient:
         _ambient.notify_state("processing")
 
@@ -394,6 +390,17 @@ def process_command(wav_path: str | None, is_followup: bool = False,
         if _ambient:
             _ambient.notify_spoke(spoken)
 
+    if consume_suit_up_request():
+        from core.suit_up import run_suit_up_sequence
+        log("Suit-up sequence requested by the model")
+        restore()
+        run_async(run_suit_up_sequence(broadcast, speak, get_context_block))
+        run_async(broadcast({"event": "idle"}))
+        if _ambient:
+            _ambient.notify_state("standby")
+        trace.finish("suit_up")
+        return
+
     if needs_followup:
         log("Follow-up expected — reopening mic")
         _followup_event.set()
@@ -413,6 +420,61 @@ _conversation_history: list[dict] = []   # shared across follow-up turns
 _followup_event = threading.Event()      # set by process_command when [FOLLOWUP] detected
 MAX_HISTORY_TURNS = 6                    # max messages (3 user+assistant pairs)
 
+# Requests from the notch island, drained by the wake loop so they never
+# overlap a voice turn: ("text", "...") or ("listen", None).
+_ui_requests: "queue.Queue[tuple[str, str | None]]" = queue.Queue()
+
+
+def _media_action(action: str) -> None:
+    """Island transport buttons. Runs off the WS loop; pushes a fresh card."""
+    from core.brain import spotify_card_event
+    from core.ws_server import broadcast
+    from integrations import spotify
+
+    handlers = {
+        "toggle": lambda: spotify.pause() if spotify.is_playing() else spotify.resume(),
+        "next": spotify.skip,
+        "previous": spotify.previous,
+        "shuffle": spotify.toggle_shuffle,
+        "repeat": spotify.cycle_repeat,
+        "refresh": lambda: None,
+    }
+    handler = handlers.get(action)
+    if handler is None:
+        return
+    try:
+        result = handler()
+        if action == "toggle" and isinstance(result, str) and "paused" in result.lower():
+            # A manual pause must not be undone when the voice turn restores audio.
+            from core.audio_duck import suppress_restore
+            suppress_restore()
+    except Exception as exc:
+        warn(f"Media {action} failed: {exc}")
+    card = spotify_card_event()
+    if card:
+        fire_async(broadcast(card))
+
+
+def _handle_ui_command(message: dict) -> None:
+    """Called on the WS loop for every message the island sends."""
+    kind = message.get("type")
+    if kind == "text":
+        text = (message.get("text") or "").strip()
+        if text:
+            _ui_requests.put(("text", text[:2000]))
+    elif kind == "listen":
+        _ui_requests.put(("listen", None))
+    elif kind == "stop":
+        from core.speech import interrupt
+        interrupt()
+    elif kind == "media":
+        threading.Thread(
+            target=_media_action,
+            args=(str(message.get("action") or ""),),
+            daemon=True,
+            name="jarvis-media",
+        ).start()
+
 
 def start_async_thread():
     """Start the shared asyncio event loop + ambient presence in a background thread."""
@@ -431,7 +493,8 @@ def start_async_thread():
         _ambient = AmbientPresence()
 
         async def _boot():
-            from core.ws_server import WS_PORT, start_server
+            from core.ws_server import WS_PORT, set_command_handler, start_server
+            set_command_handler(_handle_ui_command)
             asyncio.ensure_future(
                 _ambient.start(broadcast, speak, get_context_block)
             )
@@ -440,7 +503,7 @@ def start_async_thread():
             except OSError as exc:
                 err(
                     f"Port {WS_PORT} is already in use — another Jarvis is running. "
-                    "Quit the menu-bar app (right-click the dot → Quit Jarvis), "
+                    "Quit the running app (right-click the notch → Quit Jarvis), "
                     "then start only one copy."
                 )
                 os._exit(1)
@@ -588,6 +651,76 @@ def test_display():
 
 # ── Main wake-word loop ────────────────────────────────────────────────────────
 
+def _listen_and_run(wake_stream, oww_model, preroll, trace, preroll_audio=()):
+    """Shared by the wake word and the island's tap-to-talk."""
+    from core.ws_server import broadcast
+
+    t_start = time.time()
+    _conversation_history.clear()
+    fire_async(broadcast({"event": "wake"}))
+    fire_async(broadcast({"event": "listening"}))
+    if _ambient:
+        _ambient.notify_state("listening")
+
+    # Keep reading the mic while Spotify is paused. When music was
+    # active retain only the final 240ms of wake audio plus everything
+    # captured during the pause, preserving run-on commands without
+    # feeding 1.6 seconds of lyrics to transcription.
+    trace.mark("recording_started")
+    trace.mark("duck_started")
+    silenced, duck_audio = _silence_spotify_while_capturing(wake_stream)
+    trace.mark("duck_completed")
+    trace.set("spotify_ducked", silenced)
+    preroll_audio = list(preroll_audio)
+    seed = (
+        preroll_audio[-3:] + duck_audio
+        if silenced else preroll_audio + duck_audio
+    )
+
+    log(f"Live capture active ({(time.time() - t_start) * 1000:.0f}ms after trigger)")
+    streaming_stt = _create_streaming_stt_session(trace)
+    pcm_data = record_until_silence(
+        wake_stream, seed_frames=seed, trace=trace,
+        streaming_session=streaming_stt,
+    )
+    _stop_wake_mic(wake_stream)
+    prefetched = streaming_stt.finish() if streaming_stt else None
+    wav_path = None if prefetched else pcm_to_wav(pcm_data)
+    if wav_path:
+        trace.mark("wav_ready")
+
+    _run_command(
+        wake_stream, oww_model, preroll,
+        wav_path=wav_path, history=_conversation_history, trace=trace,
+        prefetched_transcript=prefetched,
+    )
+
+
+def _drain_ui_request(wake_stream, oww_model, preroll) -> bool:
+    """Run one pending island request. Returns True if something ran."""
+    try:
+        kind, text = _ui_requests.get_nowait()
+    except queue.Empty:
+        return False
+    from core.latency import LatencyTrace
+    if kind == "listen":
+        ok("Tap-to-talk from the island")
+        trace = LatencyTrace("tap")
+        trace.mark("wake_detected")
+        _listen_and_run(wake_stream, oww_model, preroll, trace)
+        return True
+    if kind == "text" and text:
+        ok(f"Typed: {text}")
+        trace = LatencyTrace("typed")
+        _run_command(
+            wake_stream, oww_model, preroll,
+            wav_path=None, history=_conversation_history, trace=trace,
+            prefetched_transcript=text, source="typed",
+        )
+        return True
+    return False
+
+
 def main():
     print(BANNER)
 
@@ -731,6 +864,9 @@ def main():
                 )
                 continue
 
+            if _drain_ui_request(wake_stream, oww_model, preroll):
+                continue
+
             raw = wake_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             pcm = np.frombuffer(raw, dtype=np.int16)
 
@@ -763,7 +899,6 @@ def main():
                 if wake_suppressed():
                     continue
                 last_triggered = now
-                t_wake = now
                 from core.latency import LatencyTrace
                 trace = LatencyTrace("wake")
                 trace.mark("wake_detected")
@@ -771,48 +906,12 @@ def main():
                 ok("Wake word detected!")
                 oww_model.reset()
 
-                _conversation_history.clear()
-                log("Preparing to listen…")
-
                 # Grab preroll NOW — then keep reading this same stream.
                 preroll_audio = list(preroll)
                 preroll.clear()
-
-                fire_async(broadcast({"event": "wake"}))
-                fire_async(broadcast({"event": "listening"}))
-                if _ambient:
-                    _ambient.notify_state("listening")
-
-                # Keep reading the mic while Spotify is paused. When music was
-                # active retain only the final 240ms of wake audio plus everything
-                # captured during the pause, preserving run-on commands without
-                # feeding 1.6 seconds of lyrics to transcription.
-                trace.mark("recording_started")
-                trace.mark("duck_started")
-                silenced, duck_audio = _silence_spotify_while_capturing(wake_stream)
-                trace.mark("duck_completed")
-                trace.set("spotify_ducked", silenced)
-                seed = (
-                    preroll_audio[-3:] + duck_audio
-                    if silenced else preroll_audio + duck_audio
-                )
-
-                log(f"Live capture active ({(time.time() - t_wake) * 1000:.0f}ms after wake)")
-                streaming_stt = _create_streaming_stt_session(trace)
-                pcm_data = record_until_silence(
-                    wake_stream, seed_frames=seed, trace=trace,
-                    streaming_session=streaming_stt,
-                )
-                _stop_wake_mic(wake_stream)
-                prefetched = streaming_stt.finish() if streaming_stt else None
-                wav_path = None if prefetched else pcm_to_wav(pcm_data)
-                if wav_path:
-                    trace.mark("wav_ready")
-
-                _run_command(
-                    wake_stream, oww_model, preroll,
-                    wav_path=wav_path, history=_conversation_history, trace=trace,
-                    prefetched_transcript=prefetched,
+                _listen_and_run(
+                    wake_stream, oww_model, preroll, trace,
+                    preroll_audio=preroll_audio,
                 )
 
     except KeyboardInterrupt:

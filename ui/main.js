@@ -1,4 +1,6 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage } = require('electron');
+const {
+  app, BrowserWindow, Menu, ipcMain, dialog, screen, globalShortcut,
+} = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -10,11 +12,18 @@ if (!gotLock) {
   process.exit(0);
 }
 
+// The island window is a fixed transparent canvas hanging from the top edge of
+// the screen. The visible black shape inside it grows out of the camera notch;
+// everything around it is click-through.
+const CANVAS_W = 680;
+const CANVAS_H = 660;
+const HOTKEY = process.env.JARVIS_HOTKEY || 'Alt+Space';
+
 let win = null;
-let tray = null;
 let pythonProc = null;
 let quitting = false;
 let currentState = 'offline';
+let interactive = false;
 
 function jarvisHome() {
   if (!app.isPackaged) {
@@ -109,63 +118,56 @@ function quitApp() {
   stopPython().then(() => app.quit());
 }
 
-function trayIcon(state) {
-  const file = path.join(__dirname, 'tray', `${state}.png`);
-  const fallback = path.join(__dirname, 'tray', 'idle.png');
-  const img = nativeImage.createFromPath(fs.existsSync(file) ? file : fallback);
-  img.setTemplateImage(false);
-  return img;
+// ── Notch geometry ────────────────────────────────────────────────────────────
+
+function targetDisplay() {
+  // The built-in panel is the one with a notch; fall back to the primary.
+  const all = screen.getAllDisplays();
+  return all.find((d) => d.internal) || screen.getPrimaryDisplay();
 }
 
-function setTrayState(state) {
-  currentState = state || 'idle';
-  if (!tray) return;
-  tray.setImage(trayIcon(currentState));
-  const labels = {
-    idle: 'Standby',
-    listening: 'Listening',
-    thinking: 'Thinking',
-    speaking: 'Speaking',
-    offline: 'Connecting',
-  };
-  tray.setToolTip(`Jarvis · ${labels[currentState] || 'Standby'}`);
+function notchGeometry(display) {
+  // Notched MacBooks report a ~37–38pt menu bar; classic displays ~24pt.
+  const menuBar = Math.max(0, display.workArea.y - display.bounds.y) || 24;
+  const hasNotch = menuBar >= 32;
+  const envWidth = Number(process.env.JARVIS_NOTCH_WIDTH);
+  const width = envWidth > 0 ? envWidth : (hasNotch ? 186 : 160);
+  // Without a hardware notch the island draws its own, a touch taller than
+  // the menu bar so it still reads as a shape rather than a black stripe.
+  const height = hasNotch ? menuBar : Math.max(menuBar + 8, 32);
+  return { width, height, hasNotch };
 }
 
-function positionPanel() {
-  if (!win || !tray) return;
-  const { screen } = require('electron');
-  const trayBounds = tray.getBounds();
-  const { width } = win.getBounds();
-  const display = screen.getDisplayNearestPoint({ x: trayBounds.x, y: trayBounds.y });
-  const area = display.workArea;
-  let x = Math.round(trayBounds.x + trayBounds.width / 2 - width / 2);
-  const y = Math.round(trayBounds.y + trayBounds.height + 6);
-  x = Math.min(Math.max(area.x + 6, x), area.x + area.width - width - 6);
-  win.setPosition(x, y, false);
-}
-
-function togglePanel() {
-  if (!app.isReady()) return;
-  if (!win) createPanel();
+function placeWindow() {
   if (!win) return;
-  if (win.isVisible()) {
-    win.hide();
-    return;
-  }
-  positionPanel();
-  win.show();
-  win.focus();
+  const display = targetDisplay();
+  const { bounds } = display;
+  const x = Math.round(bounds.x + bounds.width / 2 - CANVAS_W / 2);
+  win.setBounds({ x, y: bounds.y, width: CANVAS_W, height: CANVAS_H }, false);
+  win.webContents.send('geometry', notchGeometry(display));
 }
 
-function createPanel() {
-  if (!app.isReady()) return;
+function setInteractive(on) {
+  if (!win || interactive === on) return;
+  interactive = on;
+  if (on) {
+    win.setIgnoreMouseEvents(false);
+  } else {
+    win.setIgnoreMouseEvents(true, { forward: true });
+  }
+}
+
+function createIsland() {
   if (win) return;
 
   win = new BrowserWindow({
-    width: 300,
-    height: 320,
+    width: CANVAS_W,
+    height: CANVAS_H,
     show: false,
     frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
     resizable: false,
     movable: false,
     minimizable: false,
@@ -173,64 +175,94 @@ function createPanel() {
     fullscreenable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    hasShadow: true,
     focusable: true,
-    type: process.platform === 'darwin' ? 'panel' : 'normal',
+    roundedCorners: false,
+    enableLargerThanScreen: true,
+    type: process.platform === 'darwin' ? 'panel' : 'toolbar',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  win.loadFile(path.join(__dirname, 'panel.html'));
+  // Above the menu bar (and full-screen apps), on every Space.
+  win.setAlwaysOnTop(true, 'screen-saver');
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+  win.setIgnoreMouseEvents(true, { forward: true });
 
+  win.loadFile(path.join(__dirname, 'island.html'));
+  win.webContents.on('did-finish-load', () => {
+    placeWindow();
+    win.showInactive();
+    // macOS may nudge a new window below the menu bar; pin it back to the edge.
+    placeWindow();
+  });
   win.on('blur', () => {
-    if (!quitting) win.hide();
+    win?.webContents.send('window-blur');
   });
   win.on('closed', () => {
     win = null;
   });
 }
 
-function createTray() {
-  tray = new Tray(trayIcon('offline'));
-  tray.setIgnoreDoubleClickEvents(true);
-  setTrayState('offline');
-
-  tray.on('click', togglePanel);
-  tray.on('right-click', () => {
-    const menu = Menu.buildFromTemplate([
-      { label: `Jarvis — ${currentState}`, enabled: false },
-      { type: 'separator' },
-      { label: 'Show details', click: () => { if (win?.isVisible()) return; togglePanel(); } },
-      { type: 'separator' },
-      { label: 'Quit Jarvis', click: quitApp },
-    ]);
-    tray.popUpContextMenu(menu);
-  });
+function showContextMenu() {
+  const labels = {
+    idle: 'Standby',
+    listening: 'Listening',
+    thinking: 'Thinking',
+    speaking: 'Speaking',
+    offline: 'Connecting',
+  };
+  const menu = Menu.buildFromTemplate([
+    { label: `Jarvis — ${labels[currentState] || 'Standby'}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Talk to Jarvis', accelerator: HOTKEY, click: () => win?.webContents.send('hotkey') },
+    { label: 'Type a request…', click: () => win?.webContents.send('compose') },
+    { type: 'separator' },
+    { label: 'Quit Jarvis', click: quitApp },
+  ]);
+  menu.popup({ window: win });
 }
 
-ipcMain.on('jarvis-state', (_e, state) => setTrayState(state));
+ipcMain.on('jarvis-state', (_e, state) => { currentState = state || 'idle'; });
+ipcMain.on('interactive', (_e, on) => setInteractive(Boolean(on)));
+ipcMain.on('focus-input', () => {
+  if (!win) return;
+  setInteractive(true);
+  app.focus({ steal: true });
+  win.focus();
+});
+ipcMain.on('context-menu', showContextMenu);
 ipcMain.on('quit', quitApp);
 
-app.on('second-instance', () => togglePanel());
+app.on('second-instance', () => win?.webContents.send('compose'));
 
 app.whenReady().then(() => {
   if (process.platform === 'darwin') app.dock.hide();
-  createTray();
-  createPanel();
+  createIsland();
   startPython();
+
+  if (!globalShortcut.register(HOTKEY, () => win?.webContents.send('hotkey'))) {
+    console.warn(`[island] Could not register ${HOTKEY} — another app owns it`);
+  }
+
+  for (const evt of ['display-added', 'display-removed', 'display-metrics-changed']) {
+    screen.on(evt, placeWindow);
+  }
 });
 
+app.on('will-quit', () => globalShortcut.unregisterAll());
+
 app.on('window-all-closed', () => {
-  // Menu bar extra — stay running when the dropdown hides.
+  // The island is the whole UI — stay alive if the window is ever torn down.
 });
 
 app.on('activate', () => {
   if (!app.isReady()) return;
-  togglePanel();
+  if (!win) createIsland();
+  win?.webContents.send('compose');
 });
 
 app.on('before-quit', (e) => {

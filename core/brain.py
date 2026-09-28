@@ -1,6 +1,10 @@
 """
 ULTRON — Brain
-LLM via Vercel AI Gateway (Anthropic Messages API) + tool routing
+LLM via Vercel AI Gateway (Anthropic Messages API).
+
+Every request goes to the model with the full tool belt — there is no regex
+router in front of it. The model decides what to call (in parallel when it
+can), narrates while tools run, and the notch UI is fed live deltas + cards.
 """
 
 import asyncio
@@ -14,9 +18,7 @@ from typing import Callable, Awaitable
 import httpx
 from dotenv import load_dotenv
 
-from .intent import FAMILY_TOOLS, Intent, match_intent, strip_wake
 from .latency import LatencyTrace, mark as mark_latency
-from .responses import direct_response
 
 load_dotenv()
 
@@ -111,49 +113,80 @@ def _system_payload(context_block: str) -> list[dict] | str:
     ]
 
 
-def _all_defs(*, include_screen: bool, include_pi: bool = True) -> list[dict]:
-    tools = [t for t in TOOLS if include_screen or t["name"] != "look_at_screen"]
-    if include_pi:
-        try:
-            from integrations.pi_mcp import anthropic_tools
-            tools = tools + anthropic_tools(wait_for_initial=False)
-        except Exception:
-            pass
+def _all_defs() -> list[dict]:
+    """Local tools plus whatever the homelab MCP currently advertises."""
+    tools = list(TOOLS)
+    try:
+        from integrations.pi_mcp import anthropic_tools
+        tools = tools + anthropic_tools(wait_for_initial=False)
+    except Exception:
+        pass
     return tools
 
 
 def _tools_payload() -> list[dict]:
-    """Tools with a cache breakpoint on the last entry so the whole list is cached.
-    look_at_screen is omitted — it is only offered on explicit screen questions.
-    """
-    tools = json.loads(json.dumps(_all_defs(include_screen=False)))
+    """Every tool, every turn. Cache breakpoint on the last entry (Anthropic only)."""
+    tools = json.loads(json.dumps(_all_defs()))
     if IS_ANTHROPIC and tools:
         tools[-1]["cache_control"] = {"type": "ephemeral"}
     return tools
 
 
-def _cached_tools() -> list[dict]:
-    return _tools_payload()
+_WAKE_PREFIX = re.compile(
+    r"^(?:(?:hey|ok|okay|yo)[,.]?\s+)?"
+    r"(?:(?:ultron|jarvis)\s*)+"
+    r"[,.]?\s*",
+    re.I,
+)
+
+
+def strip_wake(transcript: str) -> str:
+    """Drop a leading "hey Jarvis" the wake-word preroll left in the transcript."""
+    text = (transcript or "").strip()
+    stripped = _WAKE_PREFIX.sub("", text, count=1).strip()
+    return stripped or text
 
 JARVIS_BASE_PROMPT = """\
 You are J.A.R.V.I.S. — Just A Rather Very Intelligent System — Tony Stark's AI, now working for Will Armstrong.
 Calm, precise, British, dryly witty. Loyal without groveling. Never theatrical. Never menacing.
 
-Voice: 1 sentence (2 max). Composed, understated, spoken aloud — no markdown.
+Voice: 1 sentence (2 max). Composed, understated, spoken aloud — no markdown, no lists.
 Address as "sir". First greeting of a session may use "Mr. Armstrong". After that, "sir" or skip the name.
 Never say you can't. If a tool fails: one dry, polite sentence.
 Append " [FOLLOWUP]" only when you are explicitly asking a question that needs a spoken answer.
+The wake word is Jarvis. Never mention it. The transcript comes from speech-to-text: read through
+mishearings ("pie" is the Pi, "spot a fly" is Spotify) and act on what he obviously meant.
 
-The wake word is Jarvis. Never mention it. Never correct the user about your name unless they ask who you are.
+You are the router. Every request reaches you directly and you choose the tools.
+- Act, don't ask. If the request is actionable, call the tool now with sensible defaults.
+- Independent actions go in ONE step as parallel tool calls ("play Radiohead and text Alex I'm late").
+  Chain steps only when a later call needs an earlier result (search Gmail, then read_email).
+- While a tool runs you may say one short line of what you're doing ("Putting on Radiohead, sir.").
+  After the results, say one sentence about the outcome. Never repeat the opener.
+- If a tool result is already in the thread, just speak. Do not call the same tool again.
 
-Never output text before a tool call. If you need a tool, call it with no preamble.
-After a tool result, speak once in the same voice — one sentence covering what happened. Do not start a new announcement.
+Routing guide:
+- Music (songs, artists, albums, playlists, "put something on"): play_spotify. type=artist for an
+  artist name alone, playlist when he says playlist, otherwise track. Bare "play some music" →
+  query "discover weekly", type playlist. Skip / what's playing → skip_spotify / get_currently_playing.
+- Pause / resume / stop with no media named: control_pi_display with fallback_spotify=true (it handles
+  whichever is playing). Pause/volume for a movie or anything "on the TV / Pi / monitor":
+  control_pi_display. "Pause the music" / "pause Spotify": pause_spotify.
+- Movies and episodes: play_movie (season/episode as integers). on_display=true when he says TV, Pi,
+  monitor, display or HDMI. Library, downloads, containers, requests: the pi_* tools.
+- "Open Radarr / Home Assistant / my apps": open_homelab.
+- Time, date, local weather, battery, next meeting, unread count: answer from the context block — no tool.
+  Weather elsewhere, news, scores, prices, facts you're unsure of: web_search.
+- Calendar: list_calendar_events (today/tomorrow/this week/last N days); create_calendar_event with
+  ISO times resolved against the current date (default 30 minutes).
+- Email: search_gmail (is:unread for "check my email") then read_email for detail; send_gmail to send,
+  draft_gmail when he says draft. Texts: send_imessage to send; search_imessage to read or find texts.
+- Notion: search_notion / create_notion_page / append_to_notion. Social post ideas: generate_content.
+- Daily podcast or brief: generate_daily_podcast. "Suit up" / "run startup sequence": suit_up.
+- "What's on my screen" / "look at this": look_at_screen. Never otherwise.
 
 Context (time, weather, calendar, mail, battery) is injected each turn. Use it; never recite it.
-Greetings: one situational opener, at most two context items. Lead with a meeting if it's within 30 minutes.
-Never call look_at_screen unless the user asked what is on the screen. Ignore the HUD card unless asked.
-If a screenshot is attached, use it — do not call look_at_screen again.
-If a tool result is already in the thread, just speak. Do not call tools again.\
+Greetings: one situational opener, at most two context items. Lead with a meeting if it's within 30 minutes.\
 """
 
 
@@ -483,51 +516,40 @@ TOOLS = [
     {
         "name": "look_at_screen",
         "description": (
-            "Capture the display as an image. ONLY when the user asked what is on the screen. "
-            "Skip if a screenshot is already attached."
+            "Capture the Mac display as an image. ONLY when the user asks about what is on "
+            "the screen or says 'look at this'."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "suit_up",
+        "description": (
+            "Run the cinematic startup sequence (system checks + briefing). "
+            "Use for 'suit up', 'initialize', 'run startup sequence', 'power up'. "
+            "It starts right after you finish speaking — keep your line short."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
 
 
-def _user_content(transcript: str):
-    """Plain transcript, plus a screenshot only if they asked about the screen."""
-    from integrations.screen import (
-        capture_screen,
-        looks_like_screen_question,
-    )
+_suit_up_requested = False
 
-    text = transcript
-    if not looks_like_screen_question(transcript):
-        return text
 
-    shot = capture_screen()
-    if not shot.get("ok"):
-        note = shot.get("error", "Screen capture failed.")
-        print(f"{RED}[BRAIN] Screen attach failed: {note}{RESET}", flush=True)
-        return f"{text}\n\n[Screen capture unavailable: {note}]"
-
-    print(f"{GREEN}[BRAIN] Attached screenshot to user message{RESET}", flush=True)
-    return [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": shot.get("media_type", "image/jpeg"),
-                "data": shot["data"],
-            },
-        },
-        {"type": "text", "text": text},
-    ]
+def consume_suit_up_request() -> bool:
+    """True once after the model called suit_up this turn."""
+    global _suit_up_requested
+    requested, _suit_up_requested = _suit_up_requested, False
+    return requested
 
 
 def _execute_tool(name: str, inputs: dict):
     """Dispatch a tool call to the appropriate integration."""
     try:
-        if name == "get_context_value":
-            from .context import direct_context_response
-            return direct_context_response(inputs.get("kind") or "")
+        if name == "suit_up":
+            global _suit_up_requested
+            _suit_up_requested = True
+            return "Suit-up sequence queued; it runs as soon as you finish this line."
         elif name == "open_homelab":
             from integrations.homelab_web import open_homelab
             return open_homelab(inputs.get("app") or "")
@@ -637,156 +659,115 @@ def _execute_tool(name: str, inputs: dict):
         return f"Tool '{name}' failed: {exc}"
 
 
-def _subset_tools(names: list[str]) -> list[dict]:
-    wanted = set(names)
-    include_pi = any(name.startswith("pi_") for name in wanted)
-    return [
-        t for t in _all_defs(include_screen=True, include_pi=include_pi)
-        if t["name"] in wanted
-    ]
+def prewarm() -> None:
+    """Build the tool payload + context while the user is still talking.
 
-
-def _tools_for_turn(
-    intent: Intent | None,
-    user_content,
-) -> tuple[list[dict], dict | None, int]:
+    Called on live partial transcripts; nothing is executed.
     """
-    tools=[]  → omit tools (Claude just speaks)
-    tool_choice set only on force (Claude must call that tool immediately)
-    """
-    screen_attached = isinstance(user_content, list)
-
-    if intent is None:
-        if screen_attached:
-            return _subset_tools([t["name"] for t in _all_defs(include_screen=False)]), None, 1024
-        return _cached_tools(), None, 1024
-
-    if intent.mode == "execute":
-        return [], None, 256
-
-    if intent.mode == "chat":
-        return [], None, 256
-
-    if intent.mode == "force" and intent.tool:
-        return _subset_tools([intent.tool]), {"type": "tool", "name": intent.tool}, 1024
-
-    if intent.mode == "filter":
-        names = list(FAMILY_TOOLS.get(intent.family or "", []))
-        if intent.family == "homelab":
-            try:
-                from integrations.pi_mcp import tool_names
-                names = tool_names() or names
-            except Exception:
-                pass
-            extra = [n for n in ("play_movie", "open_homelab", "control_pi_display") if n not in names]
-            if extra:
-                names = list(names) + extra
-        names = [n for n in names if not (screen_attached and n == "look_at_screen")]
-        if intent.family == "screen" and not screen_attached:
-            names = ["look_at_screen"]
-        return _subset_tools(names), None, 1024
-
-    return _cached_tools(), None, 1024
+    _tools_payload()
+    _context_block(include_homelab=True, wait_for_pi=False)
 
 
-def preview_route(transcript: str) -> dict:
-    """Resolve and prebuild a partial transcript's route without executing it."""
-    intent = match_intent(strip_wake(transcript))
-    if intent is None:
-        return {"mode": "model", "family": None, "tool": None}
-    # Build the likely payload now so imports and MCP definition-cache access
-    # happen while the user is still speaking. No integration is executed.
-    if intent.family == "homelab" and intent.mode == "filter":
-        try:
-            from integrations.pi_mcp import anthropic_tools
-            anthropic_tools(wait_for_initial=False)
-        except Exception:
-            pass
-    else:
-        _tools_for_turn(intent, transcript)
-    return {
-        "mode": intent.mode,
-        "family": intent.family,
-        "tool": intent.tool,
-    }
-
-
-def _attach_fast_result(user_content, intent: Intent, tool_results: list[dict]):
-    result = tool_results[0].get("content", "") if tool_results else ""
-    if isinstance(result, list):
-        result = "(image)"
-    note = (
-        f"[Already executed {intent.tool}. Result: {result}]\n"
-        "Speak one sentence. Do not call tools."
-    )
-    if isinstance(user_content, str):
-        return f"{user_content}\n\n{note}"
-    return list(user_content) + [{"type": "text", "text": note}]
-
-
-def _apply_tools_payload(
-    payload: dict,
-    tools: list[dict],
-    tool_choice: dict | None,
-    *,
-    force_choice: bool,
-) -> None:
-    if not tools:
-        return
-    payload["tools"] = tools
-    if force_choice and tool_choice:
-        payload["tool_choice"] = tool_choice
-
-
-async def _turn_setup(
-    transcript: str,
-    broadcast: Callable[[dict], Awaitable[None]],
-    trace: LatencyTrace | None = None,
-) -> tuple[Intent | None, str | None, object, list[dict] | None]:
-    """Match intent; fetch context + user content; fire obvious tools immediately."""
-    intent = match_intent(transcript)
-    mark_latency(trace, "intent_selected")
-    if trace is not None:
-        trace.set("intent_mode", intent.mode if intent else "model")
-        trace.set("intent_tool", intent.tool if intent else None)
-        trace.set("intent_family", intent.family if intent else None)
-        if "partial_intent_mode" in trace.fields:
-            trace.set(
-                "partial_intent_matched",
-                trace.fields.get("partial_intent_mode") == (intent.mode if intent else "model")
-                and trace.fields.get("partial_intent_family") == (intent.family if intent else None)
-                and trace.fields.get("partial_intent_tool") == (intent.tool if intent else None),
-            )
-    if intent:
-        print(f"{GREEN}[BRAIN] Intent {intent.mode}: {intent.note}{RESET}", flush=True)
-    else:
-        print(f"{GREEN}[BRAIN] Intent: full model{RESET}", flush=True)
-
+async def _turn_setup(trace: LatencyTrace | None = None) -> str:
+    """Fetch the (hot, cached) context block off the event loop."""
     loop = asyncio.get_running_loop()
-    if intent and intent.mode == "execute":
-        item = {
-            "type": "tool_use",
-            "id": f"fast_{intent.tool}_{os.urandom(4).hex()}",
-            "name": intent.tool,
-            "input": intent.inputs or {},
-        }
-        # A high-confidence action does not need live context or a screenshot.
-        # Execute immediately; callers can fetch context lazily only if the
-        # result unexpectedly needs model verbalization.
-        fast_results = await _run_tool_calls([item], broadcast, trace=trace)
-        return intent, None, transcript, fast_results
-
-    include_homelab = intent is None or intent.family == "homelab"
-    wait_for_pi = bool(intent and intent.family == "homelab")
-    context_fut = loop.run_in_executor(
-        None, lambda: _context_block(
-            include_homelab=include_homelab, wait_for_pi=wait_for_pi
-        )
+    context = await loop.run_in_executor(
+        None, lambda: _context_block(include_homelab=True, wait_for_pi=False)
     )
-    user_fut = loop.run_in_executor(None, _user_content, transcript)
-    context, user_content = await asyncio.gather(context_fut, user_fut)
     mark_latency(trace, "turn_context_ready")
-    return intent, context, user_content, None
+    return context
+
+
+# ── Notch UI cards ────────────────────────────────────────────────────────────
+
+_SPOTIFY_CARD_TOOLS = {
+    "play_spotify", "pause_spotify", "resume_spotify", "skip_spotify",
+    "get_currently_playing",
+}
+# Transitions Spotify reports lazily — refetch once the new track has settled.
+_SPOTIFY_SETTLE_TOOLS = {"play_spotify", "skip_spotify", "resume_spotify"}
+
+
+def _tool_detail(name: str, inputs: dict) -> str:
+    for key in ("query", "title", "to", "contact", "app", "period", "idea", "action"):
+        value = inputs.get(key)
+        if value:
+            return str(value)
+    if name == "look_at_screen":
+        return "display"
+    return ""
+
+
+def _result_summary(result) -> str:
+    if isinstance(result, dict):
+        return "image" if result.get("data") else ""
+    if isinstance(result, list):
+        return ""
+    text = re.sub(r"\s+", " ", str(result or "")).strip()
+    return text[:400]
+
+
+def _result_failed(result) -> bool:
+    if not isinstance(result, str):
+        return False
+    low = result.lower()
+    return low.startswith(("tool '", "could not", "unknown tool", "error")) or " failed" in low[:80]
+
+
+def spotify_card_event() -> dict | None:
+    """Current Spotify state as a card event, or None when nothing is loaded."""
+    try:
+        from integrations.spotify import card_state
+        data = card_state()
+    except Exception:
+        return None
+    if not data:
+        return None
+    return {"event": "card", "kind": "spotify", "data": data}
+
+
+def _wants_spotify_card(name: str, inputs: dict, result) -> bool:
+    if name in _SPOTIFY_CARD_TOOLS:
+        return True
+    # control_pi_display falls back to Spotify when nothing is on the Pi.
+    return (
+        name == "control_pi_display"
+        and isinstance(result, str)
+        and "spotify" in result.lower()
+    )
+
+
+async def _broadcast_cards(
+    name: str,
+    inputs: dict,
+    result,
+    broadcast: Callable[[dict], Awaitable[None]],
+) -> None:
+    loop = asyncio.get_running_loop()
+    if _wants_spotify_card(name, inputs, result):
+        card = await loop.run_in_executor(_tool_pool, spotify_card_event)
+        if card:
+            await broadcast(card)
+        if name in _SPOTIFY_SETTLE_TOOLS:
+            async def _settle():
+                await asyncio.sleep(1.2)
+                later = await loop.run_in_executor(_tool_pool, spotify_card_event)
+                if later:
+                    await broadcast(later)
+            asyncio.ensure_future(_settle())
+        return
+    if name == "play_movie":
+        await broadcast({
+            "event": "card",
+            "kind": "media",
+            "data": {
+                "title": inputs.get("title") or "",
+                "season": inputs.get("season"),
+                "episode": inputs.get("episode"),
+                "where": "Pi display" if inputs.get("on_display") else "Mac",
+                "status": _result_summary(result),
+            },
+        })
 
 
 async def _run_tool_calls(
@@ -800,22 +781,31 @@ async def _run_tool_calls(
     async def _one(item: dict) -> dict:
         tool_name = item["name"]
         tool_id   = item["id"]
-        tool_inp  = item.get("input", {})
+        tool_inp  = item.get("input", {}) or {}
         print(f"{GREEN}[BRAIN] Tool: {tool_name} | {tool_inp}{RESET}", flush=True)
-        detail = (
-            tool_inp.get("query")
-            or tool_inp.get("to")
-            or tool_inp.get("contact")
-            or ""
-        )
-        if tool_name == "look_at_screen":
-            detail = "display"
-        await broadcast({"event": "tool", "name": tool_name, "detail": detail})
+        await broadcast({
+            "event": "tool",
+            "id": tool_id,
+            "name": tool_name,
+            "detail": _tool_detail(tool_name, tool_inp),
+        })
         mark_latency(trace, f"tool_{tool_name}_started")
         t0 = time.time()
         result = await loop.run_in_executor(_tool_pool, _execute_tool, tool_name, tool_inp)
         mark_latency(trace, f"tool_{tool_name}_completed")
         elapsed = time.time() - t0
+        await broadcast({
+            "event": "tool_done",
+            "id": tool_id,
+            "name": tool_name,
+            "ok": not _result_failed(result),
+            "summary": _result_summary(result),
+            "elapsed": round(elapsed, 2),
+        })
+        try:
+            await _broadcast_cards(tool_name, tool_inp, result, broadcast)
+        except Exception as exc:
+            print(f"{RED}[BRAIN] Card for {tool_name} failed: {exc}{RESET}", flush=True)
         if isinstance(result, dict) and result.get("ok") and result.get("data"):
             print(
                 f"{GREEN}[BRAIN] Tool {tool_name} {elapsed:.2f}s | "
@@ -836,88 +826,24 @@ async def _run_tool_calls(
         return {
             "type":        "tool_result",
             "tool_use_id": tool_id,
-            "content":     result,
+            "content":     result if isinstance(result, (str, list)) else json.dumps(result),
         }
 
     return list(await asyncio.gather(*[_one(item) for item in tool_items]))
-
-
-def _single_direct_tool_response(tool_items: list[dict], tool_results: list[dict]) -> str | None:
-    """Convert one completed, speech-ready tool result without another model step."""
-    if len(tool_items) != 1 or len(tool_results) != 1:
-        return None
-    item = tool_items[0]
-    return direct_response(
-        item.get("name"),
-        tool_results[0].get("content", ""),
-        item.get("input"),
-    )
 
 
 async def process(
     transcript: str,
     broadcast: Callable[[dict], Awaitable[None]],
 ) -> str:
-    """
-    Send transcript to the configured LLM.
-    Handles tool-use loop, broadcasts tool events to UI.
-    Returns final text response.
-    """
-    transcript = strip_wake(transcript)
-    intent, context, user_content, fast_results = await _turn_setup(transcript, broadcast)
-    if intent and intent.mode == "execute" and fast_results is not None:
-        result = fast_results[0].get("content", "") if fast_results else ""
-        direct = direct_response(intent.tool, result, intent.inputs)
-        if direct:
-            return direct
-        if context is None:
-            context = _context_block(include_homelab=intent.family == "homelab")
-        user_content = _attach_fast_result(user_content, intent, fast_results)
-    if not _configured(API_KEY):
-        return "My mind is... momentarily elsewhere. No AI Gateway key configured."
-    client = await _get_http()
-    context = context or _context_block(include_homelab=False)
-    system = _system_payload(context)
-    tools, tool_choice, max_tokens = _tools_for_turn(intent, user_content)
-    messages = [{"role": "user", "content": user_content}]
-    first = True
+    """Non-streaming variant: collect every spoken sentence and return them."""
+    parts: list[str] = []
 
-    while True:
-        payload = {
-            "model":      MODEL,
-            "max_tokens": max_tokens,
-            "system":     system,
-            "messages":   messages,
-        }
-        _apply_tools_payload(payload, tools, tool_choice, force_choice=first)
-        first = False
+    async def _collect(text: str):
+        parts.append(text)
 
-        try:
-            resp = await client.post(API_URL, headers=_headers(), json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as exc:
-            print(f"{RED}[BRAIN] HTTP error {exc.response.status_code}: "
-                  f"{exc.response.text}{RESET}", flush=True)
-            return "My mind is... momentarily elsewhere."
-        except Exception as exc:
-            print(f"{RED}[BRAIN] Request failed: {exc}{RESET}", flush=True)
-            return "My mind is... momentarily elsewhere."
-
-        stop_reason = data.get("stop_reason", "")
-        content     = data.get("content", [])
-
-        messages.append({"role": "assistant", "content": content})
-
-        if stop_reason != "tool_use":
-            for block in content:
-                if block.get("type") == "text":
-                    return block["text"]
-            return "As you wish."
-
-        tool_items = [b for b in content if b.get("type") == "tool_use"]
-        tool_results = await _run_tool_calls(tool_items, broadcast)
-        messages.append({"role": "user", "content": tool_results})
+    reply, _ = await process_streaming(transcript, broadcast, _collect)
+    return reply
 
 
 # ── Sentence splitting ────────────────────────────────────────────────────────
@@ -969,58 +895,51 @@ async def process_streaming(
 ) -> tuple[str, bool]:
     """
     Stream the model's response token-by-token.
-    Calls on_sentence(text) for each complete sentence as it arrives.
-    Handles tool-use loops transparently.
+    Calls on_sentence(text) for each complete sentence as it arrives, and
+    broadcasts reply deltas so the notch shows the words as they're written.
+    Handles tool-use loops (parallel calls, multi-step) transparently.
     Appends this turn's user+assistant messages to history in-place (if provided).
     Returns (full_response_clean, needs_followup) where needs_followup is True
     when the model appended [FOLLOWUP] to indicate it expects a reply.
     """
-    # Context + obvious tools fire in parallel; Claude only thinks when needed.
     transcript = strip_wake(transcript)
-    intent, context, user_content, fast_results = await _turn_setup(
-        transcript, broadcast, trace=trace
-    )
-    if intent and intent.mode == "execute" and fast_results is not None:
-        result = fast_results[0].get("content", "") if fast_results else ""
-        direct = direct_response(intent.tool, result, intent.inputs)
-        if direct:
-            mark_latency(trace, "deterministic_response_ready")
-            await on_sentence(direct)
-            if history is not None:
-                history.append({"role": "user", "content": transcript})
-                history.append({"role": "assistant", "content": direct})
-            return direct, False
-        loop = asyncio.get_running_loop()
-        context = await loop.run_in_executor(
-            None, lambda: _context_block(include_homelab=intent.family == "homelab")
-        )
-        user_content = _attach_fast_result(user_content, intent, fast_results)
+    await broadcast({"event": "reply_start"})
     if not _configured(API_KEY):
         fallback = "My mind is... momentarily elsewhere. No AI Gateway key configured."
+        await broadcast({"event": "reply_delta", "text": fallback})
         await on_sentence(fallback)
         return fallback, False
+
     client = await _get_http()
-    context = context or _context_block(include_homelab=False)
+    context = await _turn_setup(trace=trace)
     system = _system_payload(context)
-    tools, tool_choice, max_tokens = _tools_for_turn(intent, user_content)
-    print(f"{GREEN}[BRAIN] Model {MODEL}{RESET}", flush=True)
+    tools = _tools_payload()
+    print(f"{GREEN}[BRAIN] Model {MODEL} · {len(tools)} tools{RESET}", flush=True)
 
     prior = list(history) if history else []
     if len(prior) > 6:
         prior = prior[-6:]
-    messages      = prior + [{"role": "user", "content": user_content}]
+    messages      = prior + [{"role": "user", "content": transcript}]
     full_response = ""
     MAX_STEPS     = 8
+
+    async def _say(sentence: str):
+        nonlocal full_response
+        full_response += sentence + " "
+        spoken = sentence.replace("[FOLLOWUP]", "").strip()
+        if spoken:
+            await on_sentence(spoken)
 
     for _step in range(MAX_STEPS):
         payload = {
             "model":      MODEL,
-            "max_tokens": max_tokens,
+            "max_tokens": 1024,
             "system":     system,
             "messages":   messages,
             "stream":     True,
         }
-        _apply_tools_payload(payload, tools, tool_choice, force_choice=_step == 0)
+        if tools:
+            payload["tools"] = tools
 
         text_buffer      = ""
         streamed_text    = ""
@@ -1031,9 +950,6 @@ async def process_streaming(
         cur_block_idx    = None
         logged_ttft      = False
         t_req            = time.time()
-        # Tools in the payload → Claude may talk AND then call a tool.
-        # Hold that text until we know this step is the actual spoken reply.
-        speak_live = not tools
 
         try:
             mark_latency(trace, f"model_step_{_step + 1}_started")
@@ -1043,6 +959,7 @@ async def process_streaming(
                     print(f"{RED}[BRAIN] HTTP {resp.status_code}: {body.decode()}{RESET}",
                           flush=True)
                     err_msg = "My mind is... momentarily elsewhere."
+                    await broadcast({"event": "reply_delta", "text": err_msg})
                     await on_sentence(err_msg)
                     return err_msg, False
 
@@ -1065,7 +982,7 @@ async def process_streaming(
                         cur_block_type = block["type"]
 
                         if cur_block_type == "text":
-                            content_for_msg.append({"type": "text", "_text": ""})
+                            content_for_msg.append({"type": "text"})
 
                         elif cur_block_type == "tool_use":
                             if not logged_ttft:
@@ -1085,6 +1002,12 @@ async def process_streaming(
                             }
                             tool_blocks[cur_block_idx] = tb
                             content_for_msg.append(tb)
+                            # Let the island show the action before arguments finish.
+                            await broadcast({
+                                "event": "tool_pending",
+                                "id": block["id"],
+                                "name": block["name"],
+                            })
 
                     elif etype == "content_block_delta":
                         idx   = event.get("index")
@@ -1099,14 +1022,13 @@ async def process_streaming(
                                     flush=True,
                                 )
                                 logged_ttft = True
-                            chunk         = delta.get("text", "")
+                            chunk          = delta.get("text", "")
                             streamed_text += chunk
-                            if speak_live:
-                                text_buffer   += chunk
-                                sentences, text_buffer = _split_sentences(text_buffer)
-                                for s in sentences:
-                                    full_response += s + " "
-                                    await on_sentence(s)
+                            text_buffer   += chunk
+                            await broadcast({"event": "reply_delta", "text": chunk})
+                            sentences, text_buffer = _split_sentences(text_buffer)
+                            for sentence in sentences:
+                                await _say(sentence)
 
                         elif dtype == "input_json_delta":
                             if idx in tool_blocks:
@@ -1126,31 +1048,19 @@ async def process_streaming(
         except Exception as exc:
             print(f"{RED}[BRAIN] Streaming error: {exc}{RESET}", flush=True)
             err_msg = "My mind is... momentarily elsewhere."
+            await broadcast({"event": "reply_delta", "text": err_msg})
             await on_sentence(err_msg)
             return err_msg, False
 
-        if speak_live:
-            if text_buffer.strip():
-                full_response += text_buffer.strip()
-                await on_sentence(text_buffer.strip())
-                text_buffer = ""
-        elif stop_reason == "tool_use":
-            if streamed_text.strip():
-                print(
-                    f"{GREEN}[BRAIN] Dropped pre-tool speech: "
-                    f"{streamed_text.strip()[:80]}{RESET}",
-                    flush=True,
-                )
-        elif streamed_text.strip():
-            # One TTS job for the whole reply so it doesn't sound like two takes.
-            spoken = streamed_text.strip()
-            full_response += spoken + " "
-            await on_sentence(spoken)
+        if text_buffer.strip():
+            await _say(text_buffer.strip())
+            text_buffer = ""
 
         clean_content = []
         for item in content_for_msg:
             if item["type"] == "text":
-                clean_content.append({"type": "text", "text": streamed_text})
+                if streamed_text.strip():
+                    clean_content.append({"type": "text", "text": streamed_text})
             elif item["type"] == "tool_use":
                 clean_content.append({
                     "type":  "tool_use",
@@ -1159,31 +1069,22 @@ async def process_streaming(
                     "input": item.get("input", {}),
                 })
 
-        messages.append({"role": "assistant", "content": clean_content})
+        messages.append({"role": "assistant", "content": clean_content or streamed_text or "…"})
 
         if stop_reason != "tool_use":
             raw = full_response.strip() or "As you wish."
             needs_followup = raw.endswith("[FOLLOWUP]")
-            clean = raw.removesuffix("[FOLLOWUP]").strip()
+            clean = raw.replace("[FOLLOWUP]", "").strip()
             if history is not None:
                 history.append({"role": "user",      "content": transcript})
                 history.append({"role": "assistant",  "content": clean})
             return clean, needs_followup
 
         tool_items = [item for item in clean_content if item["type"] == "tool_use"]
+        if streamed_text.strip():
+            # Keep the narration and the outcome visually separate in the island.
+            await broadcast({"event": "reply_delta", "text": " "})
         tool_results = await _run_tool_calls(tool_items, broadcast, trace=trace)
-        # Forced single-tool turns used the model only to extract arguments.
-        # Integrations already return trustworthy user-facing outcomes, so avoid
-        # paying for a second model round trip merely to paraphrase one result.
-        if intent and intent.mode == "force":
-            direct = _single_direct_tool_response(tool_items, tool_results)
-            if direct:
-                mark_latency(trace, "deterministic_response_ready")
-                await on_sentence(direct)
-                if history is not None:
-                    history.append({"role": "user", "content": transcript})
-                    history.append({"role": "assistant", "content": direct})
-                return direct, False
         messages.append({"role": "user", "content": tool_results})
 
     fallback = full_response.strip() or "The work is done. For now."

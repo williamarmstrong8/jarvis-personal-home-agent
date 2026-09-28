@@ -275,16 +275,18 @@ def create_streaming_transcriber(
     on_partial=None,
     trace=None,
 ):
-    """Create rolling STT; auto enables only for the accelerated CLI backend."""
+    """Create rolling STT so the notch UI can show words while they're spoken.
+
+    ``auto`` runs on every backend: whisper.cpp partials are cheap, and the
+    Python Whisper path shares a locked model so partials never race the final.
+    Set STT_STREAMING=off to disable live transcription entirely.
+    """
     if STREAMING_MODE in ("0", "false", "off", "disabled"):
         return None
     try:
         from .speech import selected_stt_backend
 
         backend = selected_stt_backend()
-        forced = STREAMING_MODE in ("1", "true", "on", "enabled")
-        if backend != "whisper.cpp" and not forced:
-            return None
     except Exception:
         return None
     return RollingTranscriber(
