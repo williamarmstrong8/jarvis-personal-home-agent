@@ -59,6 +59,8 @@ RESET  = "\033[0m"
 
 # ── Whisper (loaded once) ─────────────────────────────────────────────────────
 _whisper_model = None
+# Live partials (rolling STT) and the final pass can share one PyTorch model.
+_whisper_lock = threading.Lock()
 
 
 def _load_openai_model():
@@ -153,12 +155,14 @@ def _transcribe_whisper_cpp(wav_path: str) -> str:
 
 def _transcribe_openai_whisper(wav_path: str) -> str:
     model  = _get_model()
-    result = model.transcribe(
-        _wav_to_float32(wav_path),
-        language="en",
-        fp16=False,
-        condition_on_previous_text=False,
-    )
+    audio  = _wav_to_float32(wav_path)
+    with _whisper_lock:
+        result = model.transcribe(
+            audio,
+            language="en",
+            fp16=False,
+            condition_on_previous_text=False,
+        )
     return result.get("text", "").strip()
 
 
@@ -205,6 +209,23 @@ VOICE_SETTINGS = {
     "similarity_boost":  0.85,
     "use_speaker_boost": True,
 }
+
+
+# Set by the island's stop button; cleared when the next reply starts.
+_interrupted = threading.Event()
+_active_session: "_OutputSession | None" = None
+
+
+def interrupt() -> None:
+    """Cut the current reply off immediately and drop anything still queued."""
+    _interrupted.set()
+    session = _active_session
+    if session is not None:
+        session._abort()
+
+
+def was_interrupted() -> bool:
+    return _interrupted.is_set()
 
 
 def is_speaking() -> bool:
@@ -304,11 +325,13 @@ class _OutputSession:
                 latency="high",
             )
         self._stream.start()
+        global _active_session
+        _active_session = self
         self.write(np.zeros(int(PCM_RATE * 0.02), dtype=np.int16), audible=False)
         return self
 
     def write(self, samples: np.ndarray, fade_out: bool = False, audible: bool = True):
-        if samples.size == 0 or self._stream is None:
+        if samples.size == 0 or self._stream is None or _interrupted.is_set():
             return
         audio = np.ascontiguousarray(samples)
         if self._first_write:
@@ -441,6 +464,9 @@ class _OutputSession:
         return started
 
     def __exit__(self, *exc):
+        global _active_session
+        if _active_session is self:
+            _active_session = None
         self._drain_and_close()
 
 
@@ -848,12 +874,13 @@ class SpeechQueue:
         self._on_tts_ready = on_tts_ready
 
     def start(self):
+        _interrupted.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def enqueue(self, text: str):
         cleaned = for_speech(text)
-        if cleaned:
+        if cleaned and not _interrupted.is_set():
             self._texts.put(cleaned)
 
     def finish(self, timeout: float = 120.0):
@@ -895,7 +922,7 @@ class SpeechQueue:
                                 # Don't write silence into a possibly-stalled
                                 # PortAudio stream (hangs when Spotify takes over).
                                 continue
-                            if item is None:
+                            if item is None or _interrupted.is_set():
                                 break
                             text, pcm = item
                             if pcm:

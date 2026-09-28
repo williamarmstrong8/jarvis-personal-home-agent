@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; connect-src ws://localhost:8765 ws://127.0.0.1:8765" />
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="island.css" />
+</head>
+<body>
+  <div class="island is-collapsed state-offline" id="island">
+    <!-- Strip level with the camera housing: wings sit either side of the notch. -->
+    <div class="strip">
+      <div class="wing wing-left">
+        <div class="orb" id="orb"><span></span></div>
+        <span class="wing-label" id="wingLabel">Jarvis</span>
+      </div>
+      <div class="notch-gap" id="notchGap"></div>
+      <div class="wing wing-right">
+        <div class="bars" id="bars">
+          <i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <button class="icon-btn stop" id="stopBtn" title="Stop" aria-label="Stop">
+          <svg viewBox="0 0 12 12"><rect x="2" y="2" width="8" height="8" rx="1.6" /></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="body" id="body">
+      <div class="body-inner" id="bodyInner">
+        <div class="progress" id="progress"><span></span></div>
+
+        <div class="you" id="you" aria-live="polite"></div>
+        <div class="reply" id="reply" aria-live="polite"></div>
+
+        <div class="activity" id="activity"></div>
+
+        <section class="card spotify" id="spotifyCard" hidden>
+          <header>
+            <svg class="spotify-logo" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="12" fill="#1ed760" />
+              <path d="M6.2 9.3c3.9-1.2 8.2-.8 11.6 1.1M6.8 12.3c3.2-.9 6.6-.6 9.4.9M7.4 15.1c2.5-.7 5-.5 7.2.7"
+                    stroke="#000" stroke-width="1.6" stroke-linecap="round" fill="none" />
+            </svg>
+            <span class="card-app">Spotify</span>
+            <span class="card-status" id="spStatus">Playing</span>
+          </header>
+          <img class="art" id="spArt" alt="" />
+          <div class="meta">
+            <div class="title" id="spTitle"></div>
+            <div class="subtitle" id="spArtist"></div>
+          </div>
+          <div class="scrub">
+            <div class="track"><div class="fill" id="spFill"></div><div class="knob" id="spKnob"></div></div>
+            <div class="times"><span id="spPos">0:00</span><span id="spDur">0:00</span></div>
+          </div>
+          <div class="transport">
+            <button class="icon-btn" data-media="shuffle" id="spShuffle" aria-label="Shuffle">
+              <svg viewBox="0 0 24 24"><path d="M16 4h4v4M4 20 20 4M20 16v4h-4M15 15l5 5M4 4l5 5" /></svg>
+            </button>
+            <button class="icon-btn" data-media="previous" aria-label="Previous">
+              <svg viewBox="0 0 24 24"><path class="solid" d="M18 5v14l-10-7z" /><path d="M6 5v14" /></svg>
+            </button>
+            <button class="icon-btn big" data-media="toggle" id="spToggle" aria-label="Play or pause">
+              <svg viewBox="0 0 24 24" class="icon-pause"><path class="solid" d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" /></svg>
+              <svg viewBox="0 0 24 24" class="icon-play"><path class="solid" d="M7 4.5v15l12-7.5z" /></svg>
+            </button>
+            <button class="icon-btn" data-media="next" aria-label="Next">
+              <svg viewBox="0 0 24 24"><path class="solid" d="M6 5v14l10-7z" /><path d="M18 5v14" /></svg>
+            </button>
+            <button class="icon-btn" data-media="repeat" id="spRepeat" aria-label="Repeat">
+              <svg viewBox="0 0 24 24"><path d="M17 2l3 3-3 3M4 11V9a4 4 0 0 1 4-4h12M7 22l-3-3 3-3M20 13v2a4 4 0 0 1-4 4H4" /></svg>
+            </button>
+          </div>
+        </section>
+
+        <section class="card media" id="mediaCard" hidden>
+          <div class="media-icon">
+            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="12" rx="2" /><path d="M8 21h8M12 17v4" /><path class="solid" d="M10 8.5v5l4-2.5z" /></svg>
+          </div>
+          <div class="meta">
+            <div class="title" id="mediaTitle"></div>
+            <div class="subtitle" id="mediaSub"></div>
+          </div>
+        </section>
+
+        <form class="composer" id="composer" autocomplete="off">
+          <input id="composerInput" type="text" placeholder="Ask Jarvis…" spellcheck="false" />
+          <kbd id="hotkeyHint">⌥ Space to talk</kbd>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="island.js"></script>
+</body>
+</html>
