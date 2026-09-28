@@ -37,7 +37,6 @@ function main() {
 
   console.log('Generating app icon…');
   run(VENV_PYTHON, [path.join(ROOT, 'scripts', 'make-icon.py')]);
-  run(VENV_PYTHON, [path.join(ROOT, 'scripts', 'make-tray-icons.py')]);
 
   const builder = path.join(ROOT, 'node_modules', '.bin', 'electron-builder');
   if (!fs.existsSync(builder)) {

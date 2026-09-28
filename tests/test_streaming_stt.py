@@ -13,13 +13,19 @@ def pcm_frame(samples: int, value: int = 1) -> bytes:
 
 
 class RollingTranscriberTests(unittest.TestCase):
-    def test_auto_mode_requires_accelerated_backend(self):
+    def test_auto_mode_streams_on_every_backend(self):
         speech = types.ModuleType("core.speech")
         speech.selected_stt_backend = lambda: "openai-whisper"
         with (
             patch.dict(sys.modules, {"core.speech": speech}),
             patch.object(streaming_stt, "STREAMING_MODE", "auto"),
         ):
+            session = streaming_stt.create_streaming_transcriber()
+        self.assertIsNotNone(session)
+        session.close()
+
+    def test_off_mode_disables_live_transcription(self):
+        with patch.object(streaming_stt, "STREAMING_MODE", "off"):
             self.assertIsNone(streaming_stt.create_streaming_transcriber())
 
     def test_completed_partial_covering_last_speech_is_reused(self):

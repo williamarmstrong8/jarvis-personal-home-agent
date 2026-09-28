@@ -715,3 +715,83 @@ def resume() -> str:
     except Exception as exc:
         print(f"{RED}[SPOTIFY] resume error: {exc}{RESET}", flush=True)
         return f"Could not resume Spotify, sir: {exc}"
+
+
+# ── Notch UI card + transport buttons ─────────────────────────────────────────
+
+def card_state() -> dict | None:
+    """Structured now-playing data for the notch island's Spotify card."""
+    current = playback_state()
+    item = (current or {}).get("item") if current else None
+    if not item:
+        return None
+    playing = bool(current.get("is_playing"))
+    if not playing:
+        try:
+            from core.audio_duck import is_ducked
+            # Paused only because Jarvis is talking over it — still "playing".
+            playing = is_ducked()
+        except Exception:
+            pass
+    images = (item.get("album") or {}).get("images") or []
+    # Spotify lists largest first; pick the smallest that is still crisp at 2x.
+    art = next(
+        (img.get("url") for img in reversed(images) if (img.get("width") or 0) >= 300),
+        images[0].get("url") if images else None,
+    )
+    return {
+        "title": item.get("name") or "Unknown",
+        "artist": ", ".join(a.get("name", "") for a in item.get("artists") or []) or "Unknown",
+        "album": (item.get("album") or {}).get("name") or "",
+        "art": art,
+        "duration_ms": item.get("duration_ms") or 0,
+        "progress_ms": current.get("progress_ms") or 0,
+        "is_playing": playing,
+        "shuffle": bool(current.get("shuffle_state")),
+        "repeat": current.get("repeat_state") or "off",
+    }
+
+
+def previous() -> str:
+    try:
+        _next_display_sync()
+        current = playback_state()
+        device = _active_device_id(current)
+        if not device:
+            return "No active Spotify device, sir."
+        _client().previous_track(device_id=device)
+        _sync_display_after_transition(previous_item=(current or {}).get("item"))
+        return "Back one track, sir."
+    except Exception as exc:
+        print(f"{RED}[SPOTIFY] previous error: {exc}{RESET}", flush=True)
+        return f"Could not go back, sir: {exc}"
+
+
+def toggle_shuffle() -> str:
+    try:
+        current = playback_state()
+        device = _active_device_id(current)
+        if not device:
+            return "No active Spotify device, sir."
+        state = not bool((current or {}).get("shuffle_state"))
+        _client().shuffle(state, device_id=device)
+        return f"Shuffle {'on' if state else 'off'}, sir."
+    except Exception as exc:
+        print(f"{RED}[SPOTIFY] shuffle error: {exc}{RESET}", flush=True)
+        return f"Could not change shuffle, sir: {exc}"
+
+
+def cycle_repeat() -> str:
+    try:
+        current = playback_state()
+        device = _active_device_id(current)
+        if not device:
+            return "No active Spotify device, sir."
+        order = ["off", "context", "track"]
+        now = (current or {}).get("repeat_state") or "off"
+        nxt = order[(order.index(now) + 1) % len(order)] if now in order else "off"
+        _client().repeat(nxt, device_id=device)
+        return f"Repeat {nxt}, sir."
+    except Exception as exc:
+        print(f"{RED}[SPOTIFY] repeat error: {exc}{RESET}", flush=True)
+        return f"Could not change repeat, sir: {exc}"

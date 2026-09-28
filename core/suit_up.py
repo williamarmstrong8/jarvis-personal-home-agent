@@ -146,6 +146,9 @@ async def run_suit_up_sequence(
         )
         if briefing:
             log.info("Suit-up briefing: %s", briefing)
+            await broadcast({"event": "reply_start"})
+            await broadcast({"event": "reply_delta", "text": briefing})
+            await broadcast({"event": "speaking"})
             await loop.run_in_executor(None, speak_fn, briefing)
         else:
             log.warning("Suit-up briefing skipped — model unavailable")
